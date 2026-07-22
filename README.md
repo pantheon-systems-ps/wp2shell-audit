@@ -2,9 +2,10 @@
 
 Audit a Pantheon-hosted WordPress site for the wp2shell vulnerability chain (CVE-2026-60137 unauthenticated SQL injection + CVE-2026-63030 REST `batch/v1` route-confusion). Read-only — this checks for compromise, it does not remediate anything.
 
-Works two ways:
+Works three ways:
 - **As a Claude Code skill** — an agent runs the deterministic checks, reviews recently registered user accounts for anomalies a fixed regex can't catch, and publishes one formatted Google Doc report.
 - **Standalone, no Claude required** — run the script directly for the deterministic checks (logs + database), printed to your terminal and saved to a local markdown file.
+- **By hand, no script at all** — see [`docs/self-audit-guide.md`](docs/self-audit-guide.md) for the same checks done manually via WP-Admin and copy-pasteable Terminus commands.
 
 ## Prerequisites
 
@@ -49,16 +50,14 @@ The user-account anomaly review (Stage 2 in `SKILL.md`) is a judgment call acros
 
 ```
 SKILL.md                          Claude Code skill definition
+docs/
+  self-audit-guide.md              Same checks, done by hand — no script, no Claude
 scripts/
   wp2shell-audit.sh                Stage 1 — deterministic log/DB checks (no LLM needed)
   lib/
     generate_google_doc.py         Formats a markdown report as a Google Doc (Poppins typography,
                                     purple table headers, health-indicator cell coloring)
 ```
-
-## Why there's no cover page or logo
-
-The Google Doc generator here is adapted from a larger internal Pantheon reporting framework, which includes a cover page with Pantheon's logo. That's a real Pantheon brand asset, and this repo is public — so the cover page and logo were dropped entirely rather than bundling that asset here. What's left (Poppins typography, purple table headers, footer) is generic styling, not a trademark.
 
 ## What it checks for
 

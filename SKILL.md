@@ -73,4 +73,4 @@ This produces exactly one doc per audit, containing both stages, with no local f
 - Keep Stage 2's findings visibly separate from Stage 1's — never use "confirmed" language for a judgment call the way Stage 1 does for the invalid-`post_status`/SQLi/forged-changeset checks.
 - Stage 1 alone is fully automated and needs no LLM in the loop, but no longer publishes on its own — Stage 3 is what puts a doc in front of anyone. Stages 2–3 require an agent — Claude or a person — actually reading the output; they don't run unattended.
 - The generator does not share the doc with anyone — it's private to whoever's `gws` credentials created it. Share it yourself once it's published.
-- There is no cover page or logo in the generated doc by design — see the README for why.
+- There is no cover page or logo in the generated doc by design.
