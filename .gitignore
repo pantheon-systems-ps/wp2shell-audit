@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+wp2shell-report-*.md
+download.html
+.tmp-pantheon-logo.png
