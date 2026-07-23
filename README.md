@@ -12,9 +12,10 @@ Works three ways:
 ## Prerequisites
 
 - [`terminus`](https://docs.pantheon.io/terminus/install) installed and authenticated (`terminus auth:login`), with access to the target site.
+- [`terminus-site-debug`](https://github.com/pantheon-systems/terminus-site-debug) installed — `terminus logs:get` (used by `--site`) is **not** a stock Terminus command, it's provided by this plugin. Install it per that repo's instructions before running with `--site`; the script checks for this up front and exits with a pointer here if it's missing. Not needed for `--logs` mode (already-downloaded logs).
 - [`gws`](https://github.com/gws-cli/gws) installed and authenticated (only needed if you want to publish a Google Doc — the audit itself works without it).
 - `python3` (only needed for publishing — see above).
-- `bash`, standard Unix tools (`grep`, `awk`, `zcat`, etc.) — nothing exotic.
+- `bash`, standard Unix tools (`grep`, `awk`, `gzip`, etc.) — nothing exotic.
 
 ## Option A: Use it as a Claude Code skill
 
@@ -65,7 +66,7 @@ scripts/
 
 - **Nginx access log**: `batch/v1` REST route hits, `author_exclude` SQLi payloads (non-numeric values, including the `author.exclude`/`author exclude` WAF-evasion spellings), nested privileged REST writes via batch — e.g. `wp/v2/users`/`wp/v2/plugins` co-occurring with `batch/v1` (GET-based variant only), `wp-admin` plugin-upload POSTs, `delete_user=` calls, a wp-login IP-hop heuristic, WordPress self-request UA/version fingerprinting, non-browser version-fingerprint requests.
 - **PHP error log** (requires `WP_DEBUG_LOG`-style verbose logging to have been on at the time): `author__not_in` SQL injection errors, nested REST dispatch signature, changeset-publish pipeline stall marker.
-- **Database** (requires `--wp`/`--site`): posts with an invalid `post_status`, forged `customize_changeset` rows (any status), forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, orphaned `usermeta` rows, `<prefix>_<hex>`-style throwaway-admin usernames, and a full list of administrator-role accounts by registration date (for prioritizing the anomaly review).
+- **Database** (requires `--wp`/`--site`): posts with an invalid `post_status` (whitelist includes WooCommerce's standard order statuses — confirmed directly that without this, an active store's legitimate orders produce a large false positive; a `post_status` breakdown block is printed for anything else non-standard, for a judgment call rather than an automatic flag), forged `customize_changeset` rows (any status), forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, orphaned `usermeta` rows, `<prefix>_<hex>`-style throwaway-admin usernames, and a full list of administrator-role accounts by registration date (for prioritizing the anomaly review).
 
 The database checks are the highest-confidence signal — none of them depend on log retention or debug-logging configuration, and WordPress cannot produce these specific results through normal operation. Standard nginx access logs never capture POST body content, so any of the above sent entirely inside a POST body (rather than the URL/query string) is invisible to the nginx-log checks — that's a data-source limit, not a gap a different grep would close.
 

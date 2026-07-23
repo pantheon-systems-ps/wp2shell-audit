@@ -18,8 +18,9 @@ Clone or copy this repo into `~/.claude/skills/wp2shell-audit/` (personal, all p
 ## Prerequisites
 
 - `terminus` CLI installed and authenticated (`terminus auth:login`), with access to the target site.
-- `gws` CLI installed and authenticated — confirm with `gws drive about get --params '{"fields":"user"}'`.
-- `python3` for the doc generator (`scripts/lib/generate_google_doc.py`, bundled in this repo — no external framework needed).
+- [`terminus-site-debug`](https://github.com/pantheon-systems/terminus-site-debug) installed — `terminus logs:get` (used whenever Stage 1 runs with `--site`) is not a stock Terminus command, it's provided by this plugin. Stage 1 checks for it up front and exits with a pointer to this repo if it's missing. Not needed for `--logs` mode.
+- `gws` CLI installed and authenticated — only needed for Stage 3 (publishing). Stage 1 does not require it at all — confirm Stage 3 readiness with `gws drive about get --params '{"fields":"user"}'` when you get there.
+- `python3` for the doc generator (`scripts/lib/generate_google_doc.py`, bundled in this repo — no external framework needed) — same Stage-3-only scope as `gws`.
 
 ## Stage 1 — deterministic audit
 
@@ -52,11 +53,28 @@ State which specific pattern a flagged account breaks — don't flag on a hunch.
 > `142:jsmith2024:jsmith2024@gmail.com:2026-03-11` — normal: name-derived login, plausible address, unremarkable date.
 > `98:x7f2a9b1c4d:x7f2a9b1c4d@mailinator.com:2026-07-21` — flagged: login is a bare hex string with no name relation, email domain is a known disposable-mail provider, and the registration date lands the same day as this audit.
 
+A `user_login`/`display_name` matching the `<prefix>_<hex>` regex is not automatically suspicious on its own — apply the same three criteria above before flagging it, not the raw regex match. A real-name-derived login with a random suffix (e.g. `janedoe_a1b2c3`), a real consumer email domain (gmail/yahoo/outlook, not disposable), registration spread across months rather than clustered, and no administrator role — that's a normal auto-generated customer/membership username from an e-commerce or membership plugin, not a throwaway admin account. Confirmed directly: a site's own "suspicious usernames" regex match turned out to be exactly this — 16 real-looking customer accounts, non-admin, registered across 5 months, on real email providers.
+
+## Stage 2b — post_status breakdown review (only if invalid `post_status` is non-zero)
+
+If Section 4's `wp_posts` with invalid `post_status` count is non-zero, check the `== post_status breakdown for anomaly review ==` block (also printed to stdout, not written to the report — distinct status values with row counts, not per-row IDs) against the `== active plugins for post_status cross-reference ==` block printed right after it, before treating it as compromise:
+
+- **Match the status prefix/name to an actual active plugin in that list, don't just judge the naming "plausible."** A status like `fgf_automatic` is meaningless on its own — check whether an active plugin's name/slug corresponds to that prefix (e.g. a plugin literally named or abbreviating to "fgf") and name that specific plugin in your write-up if so. "Looks like it could be a plugin" without checking the actual list is a guess, not a finding.
+- A status that matches an active plugin, covering many rows (dozens to hundreds of thousands) — that plugin's own post type or workflow. Not evidence of compromise.
+- A status with **no corresponding active plugin**, especially on exactly one or two rows, or one that looks like random/injected text — the suspicious case. Note explicitly that no installed plugin explains it.
+
+**Calibration:**
+
+> `wc-partial-refund: 340, wc-backorder: 12`, active plugins include `woocommerce` — normal: matches an actually-installed plugin, meaningful row counts across real store data.
+> `xk29_temp: 1`, no plugin in the active list corresponds to `xk29` — flagged: single row, nothing installed explains this status.
+
+State which specific plugin (or its absence) a status corresponds to — don't flag or clear on a hunch. Confirmed directly: a real WooCommerce site's `wc-completed` status alone accounted for 224,000+ of a 231,501-row false positive before this whitelist/review step existed.
+
 ## Stage 3 — merge findings and publish once
 
 The findings belong inside **Section 4 (Database Analysis)**, directly after the "Suspicious usernames found" line (and after the assessment paragraph if there's no separate "sus users" list, e.g. on a clean site) — not tacked onto the end of the document.
 
-1. Edit the Stage 1 markdown file directly (the path Stage 1 printed) — insert a `**User Account Anomaly Review:**` block (no parenthetical — keep the header plain) with your findings right after the "Suspicious usernames found" line in Section 4, before that section's closing `**Assessment:**` paragraph.
+1. Edit the Stage 1 markdown file directly (the path Stage 1 printed) — insert a `**User Account Anomaly Review:**` block (no parenthetical — keep the header plain) with your Stage 2 findings, and, if Stage 2b applied, a `**Post-Status Anomaly Review:**` block with those findings, right after the "Suspicious usernames found" line in Section 4, before that section's closing `**Assessment:**` paragraph.
 2. Publish it once:
    ```
    python3 scripts/lib/generate_google_doc.py \

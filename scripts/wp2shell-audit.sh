@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # wp2shell-audit.sh — checks a site's logs and DB for the IOCs confirmed
 # during a prior wp2shell (CVE-2026-60137 / CVE-2026-63030) incident
-# investigation, and writes the full findings to a Google Doc automatically
-# via the `gws` CLI — no manual write-up needed.
+# investigation, and writes the full findings to a local markdown file.
 # Read-only — see wp2shell-cleanup.sh for the destructive follow-up.
 #
 # No file-integrity/checksum checks: Pantheon's immutable container
@@ -15,10 +14,17 @@
 #
 # --site   Pulls logs via `terminus logs:get` and runs DB checks via
 #          `terminus wp SITE.ENV --`. Requires Terminus auth already set up.
-#          Self-heals SSH host-key verification failures against
-#          never-before-contacted (or since-recycled) appserver/dbserver
-#          containers automatically — retries up to 3x, trusting whatever
-#          IP the failure names each time.
+#          `logs:get` is NOT a stock Terminus command — it's provided by
+#          the `terminus-site-debug` plugin
+#          (https://github.com/pantheon-systems/terminus-site-debug).
+#          Install it per that repo's own instructions before running this
+#          with --site; this script checks for `logs:get` up front and
+#          exits early with a pointer to that repo if it's missing, rather
+#          than failing deep into a run. Self-heals SSH host-key
+#          verification failures against never-before-contacted (or
+#          since-recycled) appserver/dbserver containers automatically —
+#          retries up to 3x, trusting whatever IP the failure names each
+#          time.
 # --logs   Directory of already-downloaded logs (skips the terminus fetch).
 # --wp     WP-CLI invocation prefix, for use with --logs. Omit to skip DB
 #          checks (log-only run).
@@ -95,7 +101,9 @@ fetch_logs_with_keyscan_retry() {
 if [[ -n "$SITE" ]]; then
   if ! terminus list 2>/dev/null | grep -q 'logs:get'; then
     echo "terminus logs:get is not available on this machine's Terminus install." >&2
-    echo "Check 'terminus list' / 'terminus self:plugin:list' and install whatever provides it." >&2
+    echo "It's provided by the terminus-site-debug plugin, not stock Terminus:" >&2
+    echo "  https://github.com/pantheon-systems/terminus-site-debug" >&2
+    echo "Install it per that repo's instructions, then re-run this." >&2
     exit 1
   fi
   CLEANUP_TMP=$(mktemp -d)
@@ -113,12 +121,6 @@ if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
   exit 1
 fi
 
-if ! command -v gws >/dev/null 2>&1; then
-  echo "gws CLI not found — required to auto-generate the Google Doc report." >&2
-  echo "Install it, or run without doc generation isn't supported by this script." >&2
-  exit 1
-fi
-
 pass=0
 flag=0
 
@@ -126,6 +128,33 @@ strip_ansi() {
   # WP-CLI/Terminus color output embeds raw ANSI escapes; the Google Docs
   # API returns a bare 500 if any survive into the uploaded content.
   sed -E $'s/\x1b\\[[0-9;]*[a-zA-Z]//g'
+}
+
+# A DB query that legitimately finds nothing returns empty output. A query
+# that FAILS instead (bad table-prefix resolution, a stray PHP notice/
+# warning corrupting the SQL) has also been observed to produce non-empty
+# output — WP-CLI's own Error:/Warning:/Notice: text — even with --silent
+# and 2>/dev/null (confirmed directly: that text prints to stdout, not
+# stderr, so neither suppresses it). Naively counting lines of output as
+# "rows found" then misreads a failed query as a compromise signal —
+# confirmed directly against real sites, where this made every one of the
+# six high-confidence checks fire identically from a single underlying
+# failure, not six independent findings.
+is_query_failure() {
+  printf '%s' "$1" | strip_ansi | grep -qE '(Error:|Warning:|Notice:|Fatal error:|Deprecated:)'
+}
+
+# Returns $1 unchanged if it looks like real data, or nothing (plus a
+# stderr warning) if it looks like a failed query — callers should treat an
+# empty result as "0, unknown" rather than "0, confirmed clean" (the
+# warning printed here is what makes that distinction visible).
+sanitize_query_result() {
+  local raw="$1" label="$2"
+  if is_query_failure "$raw"; then
+    echo "WARNING: query for '$label' failed or produced a PHP warning/notice — treating as unknown (0), NOT counted as evidence. First line: $(printf '%s' "$raw" | strip_ansi | grep -m1 .)" >&2
+    return
+  fi
+  printf '%s' "$raw"
 }
 
 report() {
@@ -153,10 +182,18 @@ md_list() {
 # Recursive: terminus logs:get's exact directory layout isn't something
 # this session could verify against a live fetch, so search rather than
 # assume a fixed path.
+#
+# gzip -dc, not zcat: on stock macOS (no Homebrew gzip shadowing the
+# system binary), zcat expects .Z (compress-format) input, not .gz —
+# confirmed directly: it silently failed on every rotated .gz archive,
+# so a run only ever scanned the current, unrotated logs and could
+# report Section 2 as clean while missing the actual attack traffic in
+# rotated history. gzip -dc handles .gz correctly on both macOS and
+# Linux.
 access_stream() {
   find "$LOG_DIR" -name 'nginx-access.log*' 2>/dev/null | sort | while read -r f; do
     case "$f" in
-      *.gz) zcat "$f" ;;
+      *.gz) gzip -dc "$f" ;;
       *)    cat "$f" ;;
     esac
   done
@@ -165,7 +202,7 @@ access_stream() {
 error_log() {
   find "$LOG_DIR" -name 'php-error.log*' 2>/dev/null | while read -r f; do
     case "$f" in
-      *.gz) zcat "$f" ;;
+      *.gz) gzip -dc "$f" ;;
       *)    cat "$f" ;;
     esac
   done
@@ -264,41 +301,91 @@ else
   T_USERMETA="${TBL_PREFIX}usermeta"
   T_POSTMETA="${TBL_PREFIX}postmeta"
 
-  invalid=$($WP_CLI db query --silent "
+  # Beyond WordPress core's own statuses, several widely-used plugins
+  # register their own legitimate custom post_status values — most
+  # commonly WooCommerce's order-status set (wc-completed/wc-pending/etc.),
+  # which on an active store can affect hundreds of thousands of rows and
+  # would otherwise swamp this check with pure noise. Confirmed directly
+  # against a real WooCommerce site's data: wc-completed accounted for the
+  # overwhelming majority of a 231,501-row false positive here. This list
+  # is WooCommerce's own standard, documented order statuses only — not a
+  # place to add arbitrary/one-off statuses; anything else non-standard
+  # still surfaces below for a judgment call instead of being silently
+  # trusted or silently flagged.
+  invalid_raw=$($WP_CLI db query --silent "
     SELECT ID FROM ${T_POSTS} WHERE post_status NOT IN (
       'publish','future','draft','pending','private','trash',
       'auto-draft','inherit',
       'request-pending','request-confirmed','request-failed','request-completed',
-      'acf-disabled'
+      'acf-disabled',
+      'wc-pending','wc-processing','wc-on-hold','wc-completed',
+      'wc-cancelled','wc-refunded','wc-failed','wc-checkout-draft'
     );" --skip-plugins --skip-themes 2>/dev/null || true)
+  invalid=$(sanitize_query_result "$invalid_raw" "invalid post_status")
   n_invalid=$(echo -n "$invalid" | grep -c . || true)
   report "${T_POSTS} with invalid post_status" "$n_invalid" $invalid
+
+  # Distinct remaining status values (not per-row IDs, which is what made
+  # this check unusable on a large site — one status shared by hundreds of
+  # thousands of legitimate rows would otherwise dump that many bullet
+  # points into the report). A handful of statuses each covering many rows
+  # reads as "another plugin's normal post type," worth a judgment call in
+  # Stage 2, not automatically as compromise; a status appearing on
+  # exactly one or two rows, or one that looks like random/injected
+  # content rather than a plugin's own naming, is the more suspicious
+  # shape. This never overrides the automated verdict above — it's context
+  # for whoever reviews a FLAGGED result.
+  if [[ "$n_invalid" -gt 0 ]]; then
+    echo
+    echo "== post_status breakdown for anomaly review =="
+    $WP_CLI db query --silent "
+      SELECT post_status, COUNT(*) AS row_count FROM ${T_POSTS} WHERE post_status NOT IN (
+        'publish','future','draft','pending','private','trash',
+        'auto-draft','inherit',
+        'request-pending','request-confirmed','request-failed','request-completed',
+        'acf-disabled',
+        'wc-pending','wc-processing','wc-on-hold','wc-completed',
+        'wc-cancelled','wc-refunded','wc-failed','wc-checkout-draft'
+      ) GROUP BY post_status ORDER BY row_count DESC LIMIT 20;" --skip-plugins --skip-themes 2>/dev/null || true
+
+    # Cross-reference for the breakdown above — without this, "does this
+    # look plugin-like" was a naming-convention guess. This is the actual
+    # active-plugin list, so a status prefix can be matched to a real,
+    # named, installed plugin instead of just judged plausible-looking.
+    echo
+    echo "== active plugins for post_status cross-reference =="
+    $WP_CLI plugin list --status=active --fields=name,title --format=csv --skip-plugins --skip-themes 2>/dev/null || true
+  fi
 
   # Not filtered by post_status: a forged changeset can sit in any status
   # (e.g. 'auto-draft', which is a normal transient state for this post
   # type), so restricting to 'publish' let real forgeries slip through.
   # The post_date/post_content signature is specific enough on its own.
-  changesets=$($WP_CLI db query --silent "
+  changesets_raw=$($WP_CLI db query --silent "
     SELECT ID FROM ${T_POSTS} WHERE post_type = 'customize_changeset'
       AND (post_date = '2020-01-01 00:00:00' OR post_content LIKE '%example.invalid%');" --skip-plugins --skip-themes 2>/dev/null || true)
+  changesets=$(sanitize_query_result "$changesets_raw" "suspicious changesets")
   n_changesets=$(echo -n "$changesets" | grep -c . || true)
   report "suspicious changesets" "$n_changesets" $changesets
 
-  navmenu=$($WP_CLI db query --silent "
+  navmenu_raw=$($WP_CLI db query --silent "
     SELECT ID FROM ${T_POSTS} WHERE post_type = 'nav_menu_item'
       AND post_date = '2020-01-01 00:00:00';" --skip-plugins --skip-themes 2>/dev/null || true)
+  navmenu=$(sanitize_query_result "$navmenu_raw" "forged nav_menu_item rows")
   n_navmenu=$(echo -n "$navmenu" | grep -c . || true)
   report "forged nav_menu_item rows" "$n_navmenu" $navmenu
 
-  postmeta=$($WP_CLI db query --silent "
+  postmeta_raw=$($WP_CLI db query --silent "
     SELECT DISTINCT post_id FROM ${T_POSTMETA} WHERE meta_value LIKE '%example.invalid%';" --skip-plugins --skip-themes 2>/dev/null || true)
+  postmeta=$(sanitize_query_result "$postmeta_raw" "${T_POSTMETA} rows referencing example.invalid")
   n_postmeta=$(echo -n "$postmeta" | grep -c . || true)
   report "${T_POSTMETA} rows referencing example.invalid" "$n_postmeta" $postmeta
 
-  orphans=$($WP_CLI db query --silent "
+  orphans_raw=$($WP_CLI db query --silent "
     SELECT um.user_id FROM ${T_USERMETA} um
     LEFT JOIN ${T_USERS} u ON u.ID = um.user_id
     WHERE u.ID IS NULL LIMIT 20;" --skip-plugins --skip-themes 2>/dev/null || true)
+  orphans=$(sanitize_query_result "$orphans_raw" "orphaned ${T_USERMETA} rows")
   n_orphans=$(echo -n "$orphans" | grep -c . || true)
   report "orphaned ${T_USERMETA} rows" "$n_orphans" $orphans
 
@@ -309,11 +396,12 @@ else
   # REPLACE() here — some layer between WP-CLI and Terminus misclassifies
   # any query containing that keyword as a write statement and returns
   # "Rows affected: -1" instead of the actual result set.
-  suspusers=$($WP_CLI db query --silent "
+  suspusers_raw=$($WP_CLI db query --silent "
     SELECT CONCAT(ID, ':', user_login)
     FROM ${T_USERS}
     WHERE user_login REGEXP '^[a-z0-9]+_[0-9a-f]{6,}\$'
        OR display_name REGEXP '^[a-z0-9]+_[0-9a-f]{6,}\$';" --skip-plugins --skip-themes 2>/dev/null || true)
+  suspusers=$(sanitize_query_result "$suspusers_raw" "suspicious <prefix>_<hex>-style usernames")
   n_suspusers=$(echo -n "$suspusers" | grep -c . || true)
   report "suspicious <prefix>_<hex>-style usernames" "$n_suspusers" $suspusers
 
@@ -459,7 +547,7 @@ $(md_list $orphans)
 **Suspicious usernames found (ID:user_login — matched via user_login or display_name):**
 $(md_list $suspusers)
 
-**Assessment:** the invalid-\`post_status\` check is the single highest-confidence signal in this entire report — WordPress cannot natively produce a \`post_status\` outside its known set, so any non-zero result here proves injected data was persisted via \`wp_insert_post()\`, not merely that the endpoint was hit. This does not depend on debug logging or any other environment-specific configuration, unlike Sections 2 and 3. The changeset check is no longer filtered to \`post_status = 'publish'\` — a forged changeset can sit in any status, including the transient \`auto-draft\` state this post type normally uses, so restricting to published rows let real forgeries through undetected. The \`nav_menu_item\` and \`postmeta\` checks target the same \`2020-01-01 00:00:00\` / \`example.invalid\` signature in other tables the exploit is known to touch — like the invalid-\`post_status\` check, these do not depend on debug logging. The suspicious-username check flags any \`user_login\` or \`display_name\` matching \`<prefix>_<hex-string>\` (e.g. \`wp2_74cc526ddf49\`, \`wpsvc_a1b2c3d4e5f6\`) — the throwaway-admin naming convention observed in the reference incident. Only \`user_login\`/\`display_name\` are checked; \`user_email\` is intentionally excluded. A non-zero result here is high-confidence on its own — this pattern does not occur in normal WordPress usage.
+**Assessment:** the invalid-\`post_status\` check is the single highest-confidence signal in this entire report when the status values involved are actually unrecognized — WordPress core cannot natively produce a \`post_status\` outside its known set, and this check's whitelist also excludes WooCommerce's own standard order statuses (\`wc-completed\`, \`wc-pending\`, etc.), which otherwise produced a confirmed false positive at real-world scale (hundreds of thousands of legitimate order rows on one site). If this count is still non-zero, check the \`== post_status breakdown for anomaly review ==\` block printed during the audit (not written to this report) before treating it as compromise — a handful of distinct statuses each covering many rows reads as another plugin's own post type, not forged content; a status on exactly one or two rows, or one that looks like random/injected text rather than a plugin's naming convention, is the more suspicious shape. This does not depend on debug logging or any other environment-specific configuration, unlike Sections 2 and 3. The changeset check is no longer filtered to \`post_status = 'publish'\` — a forged changeset can sit in any status, including the transient \`auto-draft\` state this post type normally uses, so restricting to published rows let real forgeries through undetected. The \`nav_menu_item\` and \`postmeta\` checks target the same \`2020-01-01 00:00:00\` / \`example.invalid\` signature in other tables the exploit is known to touch — like the invalid-\`post_status\` check, these do not depend on debug logging. The suspicious-username check flags any \`user_login\` or \`display_name\` matching \`<prefix>_<hex-string>\` (e.g. \`wp2_74cc526ddf49\`, \`wpsvc_a1b2c3d4e5f6\`) — the throwaway-admin naming convention observed in the reference incident. Only \`user_login\`/\`display_name\` are checked; \`user_email\` is intentionally excluded. A non-zero result here is high-confidence on its own — this pattern does not occur in normal WordPress usage.
 DBEOF
 fi)
 
