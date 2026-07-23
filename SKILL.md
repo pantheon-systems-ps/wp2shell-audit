@@ -29,7 +29,7 @@ Run:
 ./scripts/wp2shell-audit.sh --site SITE.ENV
 ```
 
-Pulls logs via `terminus logs:get`, runs nginx/PHP-error-log/DB checks (`batch/v1` traffic, `author_exclude` SQLi payloads — including the `author.exclude`/`author exclude` WAF-evasion spellings, nested privileged REST writes via batch (GET-based only), SQLi errors, forged `customize_changeset` rows in any status, forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, invalid `post_status` rows, `<prefix>_<hex>`-style usernames), and writes the findings to a local markdown file. It does **not** publish — that's Stage 3, after Stage 2's findings are merged in.
+Pulls logs directly from every appserver backing the environment, runs nginx/PHP-error-log/DB checks (`batch/v1` traffic, `author_exclude` SQLi payloads — including the `author.exclude`/`author exclude` WAF-evasion spellings, nested privileged REST writes via batch (GET-based only), SQLi errors, forged `customize_changeset` rows in any status, forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, invalid `post_status` rows, `<prefix>_<hex>`-style usernames), and writes the findings to a local markdown file. It does **not** publish — that's Stage 3, after Stage 2's findings are merged in.
 
 Output includes:
 - A `[FLAG]`/`[ ok ]` line per check
