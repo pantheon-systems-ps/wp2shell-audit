@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # wp2shell-audit.sh — checks a site's logs and DB for the IOCs confirmed
 # during a prior wp2shell (CVE-2026-60137 / CVE-2026-63030) incident
-# investigation, and writes the full findings to a Google Doc automatically
-# via the `gws` CLI — no manual write-up needed.
+# investigation, and writes findings to a local markdown report.
+# Publishing as a Google Doc is a separate Stage 3 step (needs `gws`).
 # Read-only — see wp2shell-cleanup.sh for the destructive follow-up.
 #
 # No file-integrity/checksum checks: Pantheon's immutable container
@@ -113,11 +113,8 @@ if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
   exit 1
 fi
 
-if ! command -v gws >/dev/null 2>&1; then
-  echo "gws CLI not found — required to auto-generate the Google Doc report." >&2
-  echo "Install it, or run without doc generation isn't supported by this script." >&2
-  exit 1
-fi
+# gws is only needed for Stage 3 publishing (lib/generate_google_doc.py),
+# not for this Stage 1 audit — the local markdown report is the deliverable.
 
 pass=0
 flag=0
