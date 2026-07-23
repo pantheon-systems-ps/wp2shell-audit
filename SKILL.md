@@ -1,15 +1,15 @@
 ---
 name: wp2shell-audit
-description: Use when auditing a Pantheon WordPress site for the wp2shell vulnerability chain (CVE-2026-60137 SQL injection + CVE-2026-63030 REST batch-confusion) — runs deterministic log/DB checks via scripts/wp2shell-audit.sh, reviews recently registered users for anomalies a fixed regex can't catch, and publishes one formatted Google Doc containing both.
+description: Use when auditing a Pantheon WordPress site for the wp2shell vulnerability chain (CVE-2026-60137 SQL injection + CVE-2026-63030 REST batch-confusion) — runs deterministic log/DB checks via scripts/wp2shell-audit.sh, reviews recently registered users for anomalies a fixed regex can't catch, and (only if asked) publishes a formatted Google Doc containing both.
 ---
 
 # wp2shell Audit
 
 ## Overview
 
-Three-stage check for wp2shell compromise on a Pantheon WordPress site. Stage 1 is a deterministic script (no LLM needed) covering nginx/PHP-error-log/DB signatures, saved to a local markdown file — it does not publish anything. Stage 2 is an LLM-judged review of recently registered user accounts for patterns the Stage 1 regex can't express. Stage 3 merges Stage 2's findings into the Stage 1 file and publishes it once, as a single formatted Google Doc.
+Two required stages, plus one optional one, for wp2shell compromise on a Pantheon WordPress site. Stage 1 is a deterministic script (no LLM needed) covering nginx/PHP-error-log/DB signatures, saved to a local markdown file (or printed to the terminal — your choice). Stage 2 is an LLM-judged review of recently registered user accounts for patterns the Stage 1 regex can't express. Stage 3 — publishing a formatted Google Doc — is **optional** and only happens if the user explicitly asks for a Google Doc, or ran with `--gws`. `gws` is never required just to run an audit; if it isn't installed and nobody asked for a doc, don't mention it.
 
-Publishing happens only once, after both stages are done, because the doc is built via structured Docs API calls (Poppins typography, purple table headers) — not plain markdown auto-conversion. A publish-then-patch flow would mean re-uploading markdown to update the doc, which strips that formatting back out. Merge first, publish once.
+If Stage 3 does run, it happens only once, after both prior stages are done, because the doc is built via structured Docs API calls (Poppins typography, purple table headers) — not plain markdown auto-conversion. A publish-then-patch flow would mean re-uploading markdown to update the doc, which strips that formatting back out. Merge first, publish once.
 
 ## Install
 
@@ -19,21 +19,29 @@ Clone or copy this repo into `~/.claude/skills/wp2shell-audit/` (personal, all p
 
 - `terminus` CLI installed and authenticated (`terminus auth:login`), with access to the target site.
 - `dig`, `rsync`, `nc`, and `ssh` (only needed for `--site` mode) — Stage 1 fetches logs directly from every appserver backing the environment, not via `terminus logs:get`/the `terminus-site-debug` plugin (that plugin rsyncs to a resolved appserver IP, but Pantheon's SSH gateway routes by hostname, so it fails outright — confirmed directly — and even when it works, reaching only one of an environment's possibly-many appservers can silently miss the incident). Not needed for `--logs` mode.
-- `gws` CLI installed and authenticated — only needed for Stage 3 (publishing). Stage 1 does not require it at all — confirm Stage 3 readiness with `gws drive about get --params '{"fields":"user"}'` when you get there.
+- `gws` CLI installed and authenticated — **only needed if you (or the user) actually want a Google Doc published (Stage 3).** Stages 1 and 2 never require it — don't install it, mention it, or treat it as blocking unless a Google Doc was actually requested. Confirm Stage 3 readiness with `gws drive about get --params '{"fields":"user"}'` when you get there.
 - `python3` for the doc generator (`scripts/lib/generate_google_doc.py`, bundled in this repo — no external framework needed) — same Stage-3-only scope as `gws`.
 
 ## Stage 1 — deterministic audit
 
+First, decide where the report goes: **if the user didn't already tell you an output location, ask them** — a directory to save the markdown report to (`--output`), or whether they'd rather just see it printed to the terminal (`--stdout`, no file saved). Don't guess a default location.
+
 Run:
 ```
-./scripts/wp2shell-audit.sh --site SITE.ENV
+./scripts/wp2shell-audit.sh --site SITE.ENV --output /path/to/dir
+```
+or, for terminal-only output with no file saved:
+```
+./scripts/wp2shell-audit.sh --site SITE.ENV --stdout
 ```
 
-Pulls logs directly from every appserver backing the environment, runs nginx/PHP-error-log/DB checks (`batch/v1` traffic, `author_exclude` SQLi payloads — including the `author.exclude`/`author exclude` WAF-evasion spellings, nested privileged REST writes via batch (GET-based only), SQLi errors, forged `customize_changeset` rows in any status, forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, invalid `post_status` rows, `<prefix>_<hex>`-style usernames), and writes the findings to a local markdown file. It does **not** publish — that's Stage 3, after Stage 2's findings are merged in.
+Only add `--gws` if the user has explicitly asked for a Google Doc — see Stage 3.
+
+Pulls logs directly from every appserver backing the environment, runs nginx/PHP-error-log/DB checks (`batch/v1` traffic, `author_exclude` SQLi payloads — including the `author.exclude`/`author exclude` WAF-evasion spellings, nested privileged REST writes via batch (GET-based only), SQLi errors, forged `customize_changeset` rows in any status, forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, invalid `post_status` rows, `<prefix>_<hex>`-style usernames), and writes the findings to a local markdown file (or prints them, with `--stdout`). It does **not** publish anywhere by default — Stage 3 is optional and only runs on request.
 
 Output includes:
 - A `[FLAG]`/`[ ok ]` line per check
-- `Report saved to: /path/to/wp2shell-report-<pid>-<timestamp>.md` — capture this path, Stage 3 edits this exact file
+- `Report saved to: /path/to/wp2shell-report-<site-slug>-<timestamp>.md` — capture this path, Stage 3 edits this exact file
 - A block labeled `== Recent user accounts for anomaly review ==`: the site's 100 most recently registered users (`ID, user_login, user_email, user_registered, display_name`)
 - A block labeled `== Administrator-role accounts for anomaly review ==`: every account holding the administrator role, by registration date — check these first, a nonzero count is normal (every site has admins), it's a priority list, not a flag
 
@@ -70,25 +78,30 @@ If Section 4's `wp_posts` with invalid `post_status` count is non-zero, check th
 
 State which specific plugin (or its absence) a status corresponds to — don't flag or clear on a hunch. Confirmed directly: a real WooCommerce site's `wc-completed` status alone accounted for 224,000+ of a 231,501-row false positive before this whitelist/review step existed.
 
-## Stage 3 — merge findings and publish once
+## Stage 3 — merge findings, and publish only if asked (optional)
 
-The findings belong inside **Section 4 (Database Analysis)**, directly after the "Suspicious usernames found" line (and after the assessment paragraph if there's no separate "sus users" list, e.g. on a clean site) — not tacked onto the end of the document.
+**Skip this stage entirely unless the user explicitly asked for a Google Doc**, or ran Stage 1 with `--gws`. If Stage 1 was run with `--stdout` (no saved file), Stage 3 isn't possible — there's nothing to publish; either re-run with `--output` first or just leave it at the terminal output and Stage 2 findings written back in conversation.
+
+If a doc was requested, the findings belong inside **Section 4 (Database Analysis)**, directly after the "Suspicious usernames found" line (and after the assessment paragraph if there's no separate "sus users" list, e.g. on a clean site) — not tacked onto the end of the document.
 
 1. Edit the Stage 1 markdown file directly (the path Stage 1 printed) — insert a `**User Account Anomaly Review:**` block (no parenthetical — keep the header plain) with your Stage 2 findings, and, if Stage 2b applied, a `**Post-Status Anomaly Review:**` block with those findings, right after the "Suspicious usernames found" line in Section 4, before that section's closing `**Assessment:**` paragraph.
 2. Publish it once:
    ```
    python3 scripts/lib/generate_google_doc.py \
-     --input /path/to/wp2shell-report-<pid>-<timestamp>.md \
+     --input /path/to/wp2shell-report-<site-slug>-<timestamp>.md \
      --title "wp2shell Security Audit — SITE.ENV (YYYY-MM-DD)" \
      --delete-after
    ```
    Match `--title` to what Stage 1 would have used (`wp2shell Security Audit — <site or log dir> (<today's date>)`). The script prints the finished doc's URL — share that with the requester. `--delete-after` removes the local markdown file itself once the doc is confirmed created, so no staging file is left behind on whoever's machine ran this.
+
+   If `gws` isn't installed or isn't authenticated, tell the user that specifically (and that it's only needed for this optional publish step) rather than treating the audit itself as blocked — Stages 1 and 2 are already done and usable without it.
 
 This produces exactly one doc per audit, containing both stages, with no local file left over and no separate re-upload/patch step to strip the formatting back out.
 
 ## Notes
 
 - Keep Stage 2's findings visibly separate from Stage 1's — never use "confirmed" language for a judgment call the way Stage 1 does for the invalid-`post_status`/SQLi/forged-changeset checks.
-- Stage 1 alone is fully automated and needs no LLM in the loop, but no longer publishes on its own — Stage 3 is what puts a doc in front of anyone. Stages 2–3 require an agent — Claude or a person — actually reading the output; they don't run unattended.
+- Stage 1 alone is fully automated and needs no LLM in the loop, and never publishes on its own. Stage 2 requires an agent — Claude or a person — actually reading the output; it doesn't run unattended. Stage 3 is opt-in only — never run it, or install/require `gws`, unless a Google Doc was actually requested.
+- Always confirm a report destination (`--output` dir, or `--stdout`) before running Stage 1 — ask if the user hasn't said.
 - The generator does not share the doc with anyone — it's private to whoever's `gws` credentials created it. Share it yourself once it's published.
 - There is no cover page or logo in the generated doc by design.

@@ -9,41 +9,46 @@
 # tampering the way it could on a mutable host, so that work isn't run.
 #
 # Usage:
-#   ./wp2shell-audit.sh --site SITE.ENV
-#   ./wp2shell-audit.sh --logs /path/to/log/dir --wp "wp"
+#   ./wp2shell-audit.sh --site SITE.ENV --output /path/to/dir
+#   ./wp2shell-audit.sh --logs /path/to/log/dir --wp "wp" --output /path/to/dir
+#   ./wp2shell-audit.sh --site SITE.ENV --stdout
 #
-# --site   Fetches logs directly (rsync over SSH) from EVERY appserver
-#          backing SITE.ENV, and runs DB checks via `terminus wp SITE.ENV
-#          --`. Requires Terminus auth already set up, plus `dig`, `rsync`,
-#          `nc`, and `ssh` — standard tools, no Terminus plugin needed.
-#          Does NOT use terminus-site-debug's `logs:get` — that plugin
-#          rsyncs directly to a resolved appserver IP, but Pantheon's SSH
-#          gateway routes by hostname, so that connection has been observed
-#          to fail outright (confirmed directly: exit 255 on every retry,
-#          against a real site) regardless of host-key trust. An
-#          environment can also be backed by many appserver containers at
-#          once (confirmed directly: one real site resolved to 16 distinct
-#          IPs), each holding a different slice of traffic and log-rotation
-#          history — fetching from only one, whichever happens to answer,
-#          can silently miss the actual incident. This resolves every
-#          backing appserver IP and fetches from each into its own
-#          subdirectory; if some (not all) fail, the run proceeds on what
-#          it has and says so explicitly in the report's Confidence
-#          Assessment section, rather than either blocking entirely or
-#          silently under-covering.
-# --logs   Directory of already-downloaded logs (skips the fetch above).
-# --wp     WP-CLI invocation prefix, for use with --logs. Omit to skip DB
-#          checks (log-only run).
-#
-# Every run writes a local markdown report next to this script and prints
-# its path — it does NOT publish anything. Publishing is Stage 3 (see
-# SKILL.md): Stage 2's LLM anomaly review gets inserted into that file
-# first, then it's published ONCE as a Google Doc (Poppins typography,
-# purple table headers — no cover page or logo) via
-# lib/generate_google_doc.py, which requires `gws` installed and
-# authenticated — run `gws drive about get --params '{"fields":"user"}'`
-# once to confirm. The doc is private to whoever's `gws` credentials
-# created it — nothing is shared automatically.
+# --site    Fetches logs directly (rsync over SSH) from EVERY appserver
+#           backing SITE.ENV, and runs DB checks via `terminus wp SITE.ENV
+#           --`. Requires Terminus auth already set up, plus `dig`, `rsync`,
+#           `nc`, and `ssh` — standard tools, no Terminus plugin needed.
+#           Does NOT use terminus-site-debug's `logs:get` — that plugin
+#           rsyncs directly to a resolved appserver IP, but Pantheon's SSH
+#           gateway routes by hostname, so that connection has been observed
+#           to fail outright (confirmed directly: exit 255 on every retry,
+#           against a real site) regardless of host-key trust. An
+#           environment can also be backed by many appserver containers at
+#           once (confirmed directly: one real site resolved to 16 distinct
+#           IPs), each holding a different slice of traffic and log-rotation
+#           history — fetching from only one, whichever happens to answer,
+#           can silently miss the actual incident. This resolves every
+#           backing appserver IP and fetches from each into its own
+#           subdirectory; if some (not all) fail, the run proceeds on what
+#           it has and says so explicitly in the report's Confidence
+#           Assessment section, rather than either blocking entirely or
+#           silently under-covering.
+# --logs    Directory of already-downloaded logs (skips the fetch above).
+# --wp      WP-CLI invocation prefix, for use with --logs. Omit to skip DB
+#           checks (log-only run).
+# --output  Directory to save the markdown report into. Required unless
+#           --stdout is given instead.
+# --stdout  Skip saving a report file — print the full findings to the
+#           terminal instead. Mutually exclusive with --output.
+# --gws     Optional. After the report is built, also publish it as a
+#           Google Doc via lib/generate_google_doc.py (Poppins typography,
+#           purple table headers — no cover page or logo). Requires `gws`
+#           installed and authenticated — run
+#           `gws drive about get --params '{"fields":"user"}'` once to
+#           confirm. Requires --output (there must be a saved file to
+#           upload). The doc is private to whoever's `gws` credentials
+#           created it — nothing is shared automatically. Omit this flag
+#           entirely (the default) and the audit runs fully without gws —
+#           it is never required just to run the audit.
 #
 # Also prints (not included in the report) the site's 100 most recently
 # registered users, plus a separate list of every administrator-role
@@ -64,23 +69,49 @@ WP_CLI=""
 SITE=""
 CLEANUP_TMP=""
 MD_FILE=""
+OUTPUT_DIR=""
+STDOUT_ONLY=0
+DO_GWS=0
 
 # Only cleans up the terminus logs tempdir — MD_FILE is Stage 1's actual
 # deliverable now (SKILL.md Stage 2/3 read and edit it before publishing),
 # so it must survive past this script's exit, not get wiped on the way out.
 cleanup() {
-  [[ -n "$CLEANUP_TMP" ]] && rm -rf "$CLEANUP_TMP"
+  # A bare `[[ ... ]] && rm ...` here would make cleanup()'s own exit status
+  # (false, i.e. 1) leak out as the trap's status whenever CLEANUP_TMP is
+  # unset (every --logs run) — which silently overrides the script's real
+  # `exit 0`/`exit 2` with 1. Confirmed directly: every --logs invocation
+  # exited 1 regardless of findings until this was an if-block instead.
+  if [[ -n "$CLEANUP_TMP" ]]; then
+    rm -rf "$CLEANUP_TMP"
+  fi
 }
 trap cleanup EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --site)  SITE="$2"; shift 2 ;;
-    --logs)  LOG_DIR="$2"; shift 2 ;;
-    --wp)    WP_CLI="$2"; shift 2 ;;
+    --site)   SITE="$2"; shift 2 ;;
+    --logs)   LOG_DIR="$2"; shift 2 ;;
+    --wp)     WP_CLI="$2"; shift 2 ;;
+    --output) OUTPUT_DIR="$2"; shift 2 ;;
+    --stdout) STDOUT_ONLY=1; shift ;;
+    --gws)    DO_GWS=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
+
+if [[ -z "$OUTPUT_DIR" && "$STDOUT_ONLY" -eq 0 ]]; then
+  echo "Error: specify where to save the report — pass --output /path/to/dir, or --stdout to print findings to the terminal only (no file saved)." >&2
+  exit 1
+fi
+if [[ -n "$OUTPUT_DIR" && "$STDOUT_ONLY" -eq 1 ]]; then
+  echo "Error: --output and --stdout are mutually exclusive — pick one." >&2
+  exit 1
+fi
+if [[ "$DO_GWS" -eq 1 && "$STDOUT_ONLY" -eq 1 ]]; then
+  echo "Error: --gws needs a saved report file to publish — use --output instead of --stdout." >&2
+  exit 1
+fi
 
 # An environment is backed by however many appserver containers Pantheon
 # has provisioned for it — confirmed directly against a real site: its
@@ -156,7 +187,7 @@ if [[ -n "$SITE" ]]; then
 fi
 
 if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
-  echo "Usage: $0 --site SITE.ENV | --logs /path/to/log/dir [--wp \"wp-cli invocation\"]" >&2
+  echo "Usage: $0 (--site SITE.ENV | --logs /path/to/log/dir [--wp \"wp-cli invocation\"]) (--output /path/to/dir | --stdout) [--gws]" >&2
   exit 1
 fi
 
@@ -474,7 +505,7 @@ fi
 echo
 echo "== Summary: $pass ok, $flag flagged =="
 
-### --- Build and publish the Google Doc report ------------------------------
+### --- Build the report, save/print it, and optionally publish -------------
 
 if [[ "$n_invalid" -gt 0 || "$n_changesets" -gt 0 || "$n_navmenu" -gt 0 || "$n_postmeta" -gt 0 || "$n_sqli" -gt 0 || "$n_suspusers" -gt 0 ]]; then
   VERDICT="CONFIRMED COMPROMISE — remediation required"
@@ -484,15 +515,17 @@ fi
 
 REPORT_SITE="${SITE:-$LOG_DIR}"
 REPORT_DATE=$(date +%Y-%m-%d)
-# Avoids mktemp's XXXXXX-template collision path entirely (seen to fail
-# with "File exists" in some shell environments); PID+timestamp is unique
-# enough for a single-invocation temp file. The combined trap set at the
-# top of the script cleans this up on exit, including on failure.
-MD_FILE="$SCRIPT_DIR/wp2shell-report-$$-$(date +%s).md"
-: > "$MD_FILE"
+# Filesystem-safe identifier for the report filename — SITE.ENV with the dot
+# swapped for a dash, or the log directory's basename when running via
+# --logs (no --site). Falls back to "audit" if that's somehow still empty.
+if [[ -n "$SITE" ]]; then
+  REPORT_SLUG="${SITE//./-}"
+else
+  REPORT_SLUG="$(basename "$LOG_DIR")"
+fi
+REPORT_SLUG="${REPORT_SLUG:-audit}"
 
-{
-cat <<EOF
+REPORT_CONTENT=$(cat <<EOF
 # wp2shell Security Audit Report — ${REPORT_SITE}
 
 > CONFIDENTIAL
@@ -610,19 +643,45 @@ cat <<APPEOF
 APPEOF
 fi)
 EOF
-} > "$MD_FILE"
+)
 
 DOC_TITLE="wp2shell Security Audit — ${REPORT_SITE} (${REPORT_DATE})"
 GOOGLE_DOC_GENERATOR="$SCRIPT_DIR/lib/generate_google_doc.py"
 
 echo
-echo "== Stage 1 complete — not yet published =="
-echo "Report saved to: $MD_FILE"
-echo
-echo "Next: run Stage 2 (LLM anomaly review of the recent-users block above),"
-echo "insert the findings into that file, then publish once via:"
-echo "  python3 \"$GOOGLE_DOC_GENERATOR\" --input \"$MD_FILE\" --title \"$DOC_TITLE\" --delete-after"
-echo "See SKILL.md Stage 3 for exactly where the findings go in the file."
-[[ ! -f "$GOOGLE_DOC_GENERATOR" ]] && echo "Note: generator not found at $GOOGLE_DOC_GENERATOR — check lib/ wasn't stripped out of this checkout." >&2
+echo "== Stage 1 complete =="
+
+if [[ -n "$OUTPUT_DIR" ]]; then
+  mkdir -p "$OUTPUT_DIR"
+  MD_FILE="${OUTPUT_DIR%/}/wp2shell-report-${REPORT_SLUG}-$(date +%s).md"
+  printf '%s\n' "$REPORT_CONTENT" > "$MD_FILE"
+  echo "Report saved to: $MD_FILE"
+  echo
+  echo "Next: run Stage 2 (LLM anomaly review of the recent-users block above)"
+  echo "and insert the findings into that file — see SKILL.md Stage 3."
+  if [[ "$DO_GWS" -eq 0 ]]; then
+    echo "To publish this as a Google Doc later (optional, not required to use this report):"
+    echo "  python3 \"$GOOGLE_DOC_GENERATOR\" --input \"$MD_FILE\" --title \"$DOC_TITLE\" --delete-after"
+  fi
+fi
+
+if [[ "$STDOUT_ONLY" -eq 1 ]]; then
+  echo
+  echo "$REPORT_CONTENT"
+fi
+
+if [[ "$DO_GWS" -eq 1 ]]; then
+  if ! command -v gws >/dev/null 2>&1; then
+    echo "Error: --gws was requested but the gws CLI isn't installed/on PATH. Install it and try again, or omit --gws — the report at \"$MD_FILE\" is already complete without it." >&2
+    exit 1
+  fi
+  if [[ ! -f "$GOOGLE_DOC_GENERATOR" ]]; then
+    echo "Error: --gws was requested but the generator script is missing at $GOOGLE_DOC_GENERATOR — check lib/ wasn't stripped out of this checkout." >&2
+    exit 1
+  fi
+  echo
+  echo "== Publishing to Google Docs (--gws) =="
+  python3 "$GOOGLE_DOC_GENERATOR" --input "$MD_FILE" --title "$DOC_TITLE" --delete-after
+fi
 
 [[ "$flag" -gt 0 ]] && exit 2 || exit 0

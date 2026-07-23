@@ -5,15 +5,15 @@
 Audit a Pantheon-hosted WordPress site for the wp2shell vulnerability chain (CVE-2026-60137 unauthenticated SQL injection + CVE-2026-63030 REST `batch/v1` route-confusion). Read-only — this checks for compromise, it does not remediate anything.
 
 Works three ways:
-- **As a Claude Code skill** — an agent runs the deterministic checks, reviews recently registered user accounts for anomalies a fixed regex can't catch, and publishes one formatted Google Doc report.
-- **Standalone, no Claude required** — run the script directly for the deterministic checks (logs + database), printed to your terminal and saved to a local markdown file.
+- **As a Claude Code skill** — an agent runs the deterministic checks and reviews recently registered user accounts for anomalies a fixed regex can't catch, saving findings to markdown (or printing them to the terminal). It only publishes a Google Doc if you actually ask for one.
+- **Standalone, no Claude required** — run the script directly for the deterministic checks (logs + database), either printed to your terminal or saved to a local markdown file (your choice).
 - **By hand, no script at all** — see [`docs/self-audit-guide.md`](docs/self-audit-guide.md) for the same checks done manually via WP-Admin and copy-pasteable Terminus commands.
 
 ## Prerequisites
 
 - [`terminus`](https://docs.pantheon.io/terminus/install) installed and authenticated (`terminus auth:login`), with access to the target site.
 - `dig`, `rsync`, `nc`, and `ssh` (only needed for `--site` mode) — used to fetch logs directly from every appserver backing the environment. **Not** `terminus logs:get`/the `terminus-site-debug` plugin: that plugin rsyncs straight to a resolved appserver IP, but Pantheon's SSH gateway routes by hostname, so it fails outright (confirmed directly: exit 255 on every attempt) — and even when it does work, an environment can be backed by many appserver containers at once (confirmed directly: one real site resolved to 16), each with a different slice of traffic and log-rotation history, so reaching only one can silently miss the actual incident. Not needed for `--logs` mode (already-downloaded logs).
-- [`gws`](https://github.com/gws-cli/gws) installed and authenticated (only needed if you want to publish a Google Doc — the audit itself works without it).
+- [`gws`](https://github.com/googleworkspace/cli) installed and authenticated — **only if** you want to publish a Google Doc (`--gws`). The audit itself never requires it and doesn't check for it unless you pass `--gws`.
 - `python3` (only needed for publishing — see above).
 - `bash`, standard Unix tools (`grep`, `awk`, `gzip`, etc.) — nothing exotic.
 
@@ -27,21 +27,27 @@ git clone <this-repo-url> ~/.claude/skills/wp2shell-audit
 
 (Use `<project>/.claude/skills/wp2shell-audit` instead for a project-scoped install.)
 
-Claude Code auto-discovers `SKILL.md` in that location. Start a session and ask it to run a wp2shell audit against a site — it'll follow `SKILL.md`'s three stages: run the deterministic script, review recent user accounts for anomalies, then publish one merged Google Doc.
+Claude Code auto-discovers `SKILL.md` in that location. Start a session and ask it to run a wp2shell audit against a site — it'll run the deterministic script, review recent user accounts for anomalies, and ask you where to save the report if you haven't said. It only publishes a Google Doc if you explicitly ask for one.
 
 ## Option B: Run the script yourself, no Claude involved
 
 ```
-./scripts/wp2shell-audit.sh --site SITE.ENV
+./scripts/wp2shell-audit.sh --site SITE.ENV --output /path/to/dir
+```
+
+or, for terminal-only output with no file saved:
+
+```
+./scripts/wp2shell-audit.sh --site SITE.ENV --stdout
 ```
 
 or, against logs you've already downloaded:
 
 ```
-./scripts/wp2shell-audit.sh --logs /path/to/log/dir --wp "terminus wp SITE.ENV --"
+./scripts/wp2shell-audit.sh --logs /path/to/log/dir --wp "terminus wp SITE.ENV --" --output /path/to/dir
 ```
 
-This runs every deterministic check (nginx access log, PHP error log, and — if `--wp`/`--site` is given — direct database queries), prints a `[FLAG]`/`[ ok ]` line per check, and saves the full findings to a local markdown file next to the script. It does not publish anywhere or require an LLM. If you want a Google Doc out of it, you can still do that yourself:
+This runs every deterministic check (nginx access log, PHP error log, and — if `--wp`/`--site` is given — direct database queries), prints a `[FLAG]`/`[ ok ]` line per check, and either saves the full findings to a markdown file in the directory you gave `--output`, or prints them straight to the terminal with `--stdout`. One of `--output`/`--stdout` is required — there's no default location. It does not publish anywhere and never requires `gws` unless you ask for it. To publish as a Google Doc, add `--gws` to the same command (requires `gws` installed and authenticated), or run the generator yourself afterward against a saved report:
 
 ```
 python3 scripts/lib/generate_google_doc.py --input /path/to/report.md --title "Your Title"
