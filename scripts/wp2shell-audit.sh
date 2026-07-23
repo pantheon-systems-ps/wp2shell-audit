@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # wp2shell-audit.sh — checks a site's logs and DB for the IOCs confirmed
 # during a prior wp2shell (CVE-2026-60137 / CVE-2026-63030) incident
-# investigation, and writes the full findings to a Google Doc automatically
-# via the `gws` CLI — no manual write-up needed.
+# investigation, and writes the findings to a local markdown report. It does
+# NOT publish anything — see SKILL.md Stage 3 for the Google Doc step, which
+# runs separately via lib/generate_google_doc.py once Stage 2's findings are
+# merged in.
 # Read-only — see wp2shell-cleanup.sh for the destructive follow-up.
 #
 # No file-integrity/checksum checks: Pantheon's immutable container
@@ -113,12 +115,6 @@ if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
   exit 1
 fi
 
-if ! command -v gws >/dev/null 2>&1; then
-  echo "gws CLI not found — required to auto-generate the Google Doc report." >&2
-  echo "Install it, or run without doc generation isn't supported by this script." >&2
-  exit 1
-fi
-
 pass=0
 flag=0
 
@@ -156,7 +152,12 @@ md_list() {
 access_stream() {
   find "$LOG_DIR" -name 'nginx-access.log*' 2>/dev/null | sort | while read -r f; do
     case "$f" in
-      *.gz) zcat "$f" ;;
+      # macOS ships a BSD zcat at /usr/bin/zcat that only understands the
+      # .Z suffix — fed a .gz file it appends ".Z" to the name, fails to
+      # stat that, and silently drops the whole rotated log from the
+      # stream (undercounting every check below). `gzip -dc` decompresses
+      # .gz correctly under both GNU and BSD gzip, so use that everywhere.
+      *.gz) gzip -dc "$f" ;;
       *)    cat "$f" ;;
     esac
   done
@@ -165,7 +166,7 @@ access_stream() {
 error_log() {
   find "$LOG_DIR" -name 'php-error.log*' 2>/dev/null | while read -r f; do
     case "$f" in
-      *.gz) zcat "$f" ;;
+      *.gz) gzip -dc "$f" ;;
       *)    cat "$f" ;;
     esac
   done
@@ -484,6 +485,11 @@ echo
 echo "Next: run Stage 2 (LLM anomaly review of the recent-users block above),"
 echo "insert the findings into that file, then publish once via:"
 echo "  python3 \"$GOOGLE_DOC_GENERATOR\" --input \"$MD_FILE\" --title \"$DOC_TITLE\" --delete-after"
+if ! command -v gws >/dev/null 2>&1; then
+  echo
+  echo "Note: gws CLI not found on this machine — install and authenticate it" >&2
+  echo "(see SKILL.md Prerequisites) before running the publish step above." >&2
+fi
 echo "See SKILL.md Stage 3 for exactly where the findings go in the file."
 [[ ! -f "$GOOGLE_DOC_GENERATOR" ]] && echo "Note: generator not found at $GOOGLE_DOC_GENERATOR — check lib/ wasn't stripped out of this checkout." >&2
 
