@@ -12,20 +12,26 @@
 #   ./wp2shell-audit.sh --site SITE.ENV
 #   ./wp2shell-audit.sh --logs /path/to/log/dir --wp "wp"
 #
-# --site   Pulls logs via `terminus logs:get` and runs DB checks via
-#          `terminus wp SITE.ENV --`. Requires Terminus auth already set up.
-#          `logs:get` is NOT a stock Terminus command — it's provided by
-#          the `terminus-site-debug` plugin
-#          (https://github.com/pantheon-systems/terminus-site-debug).
-#          Install it per that repo's own instructions before running this
-#          with --site; this script checks for `logs:get` up front and
-#          exits early with a pointer to that repo if it's missing, rather
-#          than failing deep into a run. Self-heals SSH host-key
-#          verification failures against never-before-contacted (or
-#          since-recycled) appserver/dbserver containers automatically —
-#          retries up to 3x, trusting whatever IP the failure names each
-#          time.
-# --logs   Directory of already-downloaded logs (skips the terminus fetch).
+# --site   Fetches logs directly (rsync over SSH) from EVERY appserver
+#          backing SITE.ENV, and runs DB checks via `terminus wp SITE.ENV
+#          --`. Requires Terminus auth already set up, plus `dig`, `rsync`,
+#          `nc`, and `ssh` — standard tools, no Terminus plugin needed.
+#          Does NOT use terminus-site-debug's `logs:get` — that plugin
+#          rsyncs directly to a resolved appserver IP, but Pantheon's SSH
+#          gateway routes by hostname, so that connection has been observed
+#          to fail outright (confirmed directly: exit 255 on every retry,
+#          against a real site) regardless of host-key trust. An
+#          environment can also be backed by many appserver containers at
+#          once (confirmed directly: one real site resolved to 16 distinct
+#          IPs), each holding a different slice of traffic and log-rotation
+#          history — fetching from only one, whichever happens to answer,
+#          can silently miss the actual incident. This resolves every
+#          backing appserver IP and fetches from each into its own
+#          subdirectory; if some (not all) fail, the run proceeds on what
+#          it has and says so explicitly in the report's Confidence
+#          Assessment section, rather than either blocking entirely or
+#          silently under-covering.
+# --logs   Directory of already-downloaded logs (skips the fetch above).
 # --wp     WP-CLI invocation prefix, for use with --logs. Omit to skip DB
 #          checks (log-only run).
 #
@@ -76,40 +82,73 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Pantheon's appserver containers are ephemeral and rotate between calls —
-# a never-before-contacted (or since-recycled) container fails SSH host-key
-# verification on the first hit, and pinning one IP doesn't stick since the
-# next call can land on a different container entirely. Self-heal by
-# trusting whatever IP the failure names and retrying, rather than a
-# one-time keyscan.
-fetch_logs_with_keyscan_retry() {
-  local site="$1" dest="$2" attempt output status ips ip
-  for attempt in 1 2 3; do
-    output=$(terminus logs:get "$site" --all "$dest" 2>&1)
-    status=$?
-    echo "$output" >&2
-    [[ $status -eq 0 ]] && return 0
-    ips=$(echo "$output" | grep -oE '@[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr -d '@' | sort -u)
-    [[ -z "$ips" ]] && return 1
-    while read -r ip; do
-      ssh-keyscan -p 2222 -H "$ip" >> ~/.ssh/known_hosts 2>/dev/null
-    done <<< "$ips"
-  done
-  return 1
+# An environment is backed by however many appserver containers Pantheon
+# has provisioned for it — confirmed directly against a real site: its
+# appserver hostname resolved to 16 distinct IPs, each holding a DIFFERENT
+# slice of traffic and log-rotation history (different byte sizes, same
+# rotation date). Fetching from only one appserver — whichever happens to
+# answer — can silently miss the actual incident if it landed on a
+# container this run didn't reach; there is no way to tell from the output
+# alone that anything was missed.
+#
+# This does NOT use terminus-site-debug's `logs:get` (a plugin, not stock
+# Terminus). That plugin rsyncs directly to a resolved appserver IP, but
+# Pantheon's SSH gateway routes by hostname — confirmed directly, against a
+# real site, that every such attempt fails with exit 255 regardless of
+# retries. The working pattern is hostname-based SSH auth with the TCP
+# connection pinned to a specific IP via a ProxyCommand — this fetches from
+# EVERY resolved appserver IP this way, into its own subdirectory.
+# access_stream()/error_log() below already recurse the whole log directory
+# by filename pattern (not a fixed path), so nothing else needs to change
+# to pick up every appserver's logs once they're all fetched here.
+#
+# Requires: dig, rsync, nc, ssh — standard tools, no Terminus plugin.
+fetch_all_appserver_logs() {
+  local site_name="$1" site_env="$2" dest="$3"
+  local uuid host ips ip ok=0 failed=0
+
+  uuid=$(terminus site:info "$site_name" --field=id 2>/dev/null)
+  if [[ -z "$uuid" ]]; then
+    echo "Could not resolve site UUID for '$site_name' via terminus site:info." >&2
+    return 1
+  fi
+
+  host="appserver.${site_env}.${uuid}.drush.in"
+  ips=$(dig +short "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+  if [[ -z "$ips" ]]; then
+    echo "No appserver DNS records found for ${site_name}.${site_env} (${host}) — environment may not exist or isn't provisioned." >&2
+    return 1
+  fi
+
+  while read -r ip; do
+    [[ -z "$ip" ]] && continue
+    ssh-keyscan -p 2222 -H "$ip" >> ~/.ssh/known_hosts 2>/dev/null
+    mkdir -p "${dest}/appserver-${ip}"
+    if rsync -rlz -e "ssh -p 2222 -o ProxyCommand='nc ${ip} 2222' -o StrictHostKeyChecking=accept-new" \
+        "${site_env}.${uuid}@${host}:logs/" "${dest}/appserver-${ip}/" >&2 2>&1; then
+      ok=$((ok + 1))
+    else
+      failed=$((failed + 1))
+      echo "  [warn] appserver ${ip}: rsync failed — this appserver's logs are MISSING from this audit, not counted as clean" >&2
+    fi
+  done <<< "$ips"
+
+  APPSERVERS_REACHED=$ok
+  APPSERVERS_TOTAL=$((ok + failed))
+  echo "Fetched logs from ${ok}/${APPSERVERS_TOTAL} appserver(s) for ${site_name}.${site_env}." >&2
+  [[ "$ok" -gt 0 ]] && return 0 || return 1
 }
 
+APPSERVERS_REACHED=0
+APPSERVERS_TOTAL=0
+
 if [[ -n "$SITE" ]]; then
-  if ! terminus list 2>/dev/null | grep -q 'logs:get'; then
-    echo "terminus logs:get is not available on this machine's Terminus install." >&2
-    echo "It's provided by the terminus-site-debug plugin, not stock Terminus:" >&2
-    echo "  https://github.com/pantheon-systems/terminus-site-debug" >&2
-    echo "Install it per that repo's instructions, then re-run this." >&2
-    exit 1
-  fi
+  SITE_NAME="${SITE%.*}"
+  SITE_ENV="${SITE##*.}"
   CLEANUP_TMP=$(mktemp -d)
-  echo "Fetching logs for $SITE via terminus logs:get ..." >&2
-  if ! fetch_logs_with_keyscan_retry "$SITE" "$CLEANUP_TMP"; then
-    echo "terminus logs:get failed after retrying with host-key trust — see output above." >&2
+  echo "Fetching logs for $SITE from every backing appserver ..." >&2
+  if ! fetch_all_appserver_logs "$SITE_NAME" "$SITE_ENV" "$CLEANUP_TMP"; then
+    echo "Could not fetch logs from any appserver for $SITE — see output above." >&2
     exit 1
   fi
   LOG_DIR="$CLEANUP_TMP"
@@ -179,9 +218,11 @@ md_list() {
   fi
 }
 
-# Recursive: terminus logs:get's exact directory layout isn't something
-# this session could verify against a live fetch, so search rather than
-# assume a fixed path.
+# Recursive: fetch_all_appserver_logs lands each appserver's logs in its
+# own appserver-<ip>/ subdirectory, so this has to search rather than
+# assume a single fixed path — which is also exactly what makes multi-
+# appserver coverage transparent to these two functions: every appserver
+# that was fetched just gets swept up the same way.
 #
 # gzip -dc, not zcat: on stock macOS (no Homebrew gzip shadowing the
 # system binary), zcat expects .Z (compress-format) input, not .gz —
@@ -557,8 +598,17 @@ fi)
 
 - Section 4 (Database) results are the most reliable — they don't depend on log retention or debug-logging configuration.
 - Section 3 (PHP error log) results corroborate Section 4 but can under-report on environments where verbose error logging is off.
-- Section 2 (Nginx) is complete for the log retention window fetched by \`terminus logs:get\`, but a fully clean Section 2 does not rule out compromise if Sections 3/4 are non-zero — it means the later attack stages left no nginx-visible trace in this window, not that they didn't happen.
+- Section 2 (Nginx) is complete for the log retention window fetched from every appserver reached, but a fully clean Section 2 does not rule out compromise if Sections 3/4 are non-zero — it means the later attack stages left no nginx-visible trace in this window, not that they didn't happen.
 - Standard nginx access logs never capture POST body content. A \`rest_route=/batch/v1\` reference, a nested privileged write, or an \`author_exclude\` payload sent entirely inside a POST body (rather than the URL/query string) is structurally invisible to every check in Section 2 — this is a data-source limit, not a detection gap that a different grep would close.
+$(if [[ "$APPSERVERS_TOTAL" -gt 0 && "$APPSERVERS_REACHED" -lt "$APPSERVERS_TOTAL" ]]; then
+cat <<APPEOF
+- **Log coverage is INCOMPLETE: only ${APPSERVERS_REACHED} of ${APPSERVERS_TOTAL} backing appserver(s) were reached.** Each appserver can hold a different slice of traffic and a different log-rotation window — Section 2 above reflects only what the reached appserver(s) had, not the whole environment. Do not treat a clean Section 2 as conclusive here; re-run once connectivity to the missing appserver(s) is fixed before ruling anything out on nginx-log grounds alone.
+APPEOF
+elif [[ "$APPSERVERS_TOTAL" -gt 0 ]]; then
+cat <<APPEOF
+- Log coverage: all ${APPSERVERS_TOTAL} backing appserver(s) were reached.
+APPEOF
+fi)
 EOF
 } > "$MD_FILE"
 

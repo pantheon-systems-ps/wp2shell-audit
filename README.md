@@ -12,7 +12,7 @@ Works three ways:
 ## Prerequisites
 
 - [`terminus`](https://docs.pantheon.io/terminus/install) installed and authenticated (`terminus auth:login`), with access to the target site.
-- [`terminus-site-debug`](https://github.com/pantheon-systems/terminus-site-debug) installed — `terminus logs:get` (used by `--site`) is **not** a stock Terminus command, it's provided by this plugin. Install it per that repo's instructions before running with `--site`; the script checks for this up front and exits with a pointer here if it's missing. Not needed for `--logs` mode (already-downloaded logs).
+- `dig`, `rsync`, `nc`, and `ssh` (only needed for `--site` mode) — used to fetch logs directly from every appserver backing the environment. **Not** `terminus logs:get`/the `terminus-site-debug` plugin: that plugin rsyncs straight to a resolved appserver IP, but Pantheon's SSH gateway routes by hostname, so it fails outright (confirmed directly: exit 255 on every attempt) — and even when it does work, an environment can be backed by many appserver containers at once (confirmed directly: one real site resolved to 16), each with a different slice of traffic and log-rotation history, so reaching only one can silently miss the actual incident. Not needed for `--logs` mode (already-downloaded logs).
 - [`gws`](https://github.com/gws-cli/gws) installed and authenticated (only needed if you want to publish a Google Doc — the audit itself works without it).
 - `python3` (only needed for publishing — see above).
 - `bash`, standard Unix tools (`grep`, `awk`, `gzip`, etc.) — nothing exotic.

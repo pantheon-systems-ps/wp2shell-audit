@@ -18,7 +18,7 @@ Clone or copy this repo into `~/.claude/skills/wp2shell-audit/` (personal, all p
 ## Prerequisites
 
 - `terminus` CLI installed and authenticated (`terminus auth:login`), with access to the target site.
-- [`terminus-site-debug`](https://github.com/pantheon-systems/terminus-site-debug) installed — `terminus logs:get` (used whenever Stage 1 runs with `--site`) is not a stock Terminus command, it's provided by this plugin. Stage 1 checks for it up front and exits with a pointer to this repo if it's missing. Not needed for `--logs` mode.
+- `dig`, `rsync`, `nc`, and `ssh` (only needed for `--site` mode) — Stage 1 fetches logs directly from every appserver backing the environment, not via `terminus logs:get`/the `terminus-site-debug` plugin (that plugin rsyncs to a resolved appserver IP, but Pantheon's SSH gateway routes by hostname, so it fails outright — confirmed directly — and even when it works, reaching only one of an environment's possibly-many appservers can silently miss the incident). Not needed for `--logs` mode.
 - `gws` CLI installed and authenticated — only needed for Stage 3 (publishing). Stage 1 does not require it at all — confirm Stage 3 readiness with `gws drive about get --params '{"fields":"user"}'` when you get there.
 - `python3` for the doc generator (`scripts/lib/generate_google_doc.py`, bundled in this repo — no external framework needed) — same Stage-3-only scope as `gws`.
 
