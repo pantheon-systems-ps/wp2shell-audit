@@ -406,7 +406,18 @@ echo
 
 ### --- Nginx access log checks — always run in full, every field captured ---
 
-n_batch=$(access_stream | grep -cE '(\?rest_route=/batch/v1|/wp-json/batch/v1)' || true)
+# Anchored to the actual HTTP request line (nginx logs it verbatim inside
+# one pair of quotes: "METHOD /path?query HTTP/1.1") rather than matching
+# "batch/v1" anywhere in the combined log line — an unanchored match also
+# hits the referer/user-agent fields later in that same line, plus any
+# unrelated path merely containing this substring. Confirmed directly:
+# batch/v1 is also Kubernetes' own apps/CronJobs API groupVersion
+# (/apis/batch/v1/...), so k8s-adjacent traffic or a monitoring client's
+# UA/referer produced false positives here three different ways before
+# this was scoped to the request line and required a WordPress-specific
+# route prefix.
+BATCH_V1_REQUEST_RE='"[A-Z]+ [^"]*(\?rest_route=/batch/v1|/wp-json/batch/v1)[^"]*HTTP/[0-9.]+"'
+n_batch=$(access_stream | grep -cE "$BATCH_V1_REQUEST_RE" || true)
 report "batch/v1 route hits" "$n_batch"
 
 n_upload=$(access_stream | grep -c 'update.php?action=upload-plugin' || true)
@@ -447,8 +458,12 @@ report "author_exclude SQLi payload (non-numeric value)" "$n_authorexcl" $author
 
 # Only catches the GET-based variant (params in the query string, visible
 # in the access log) — a POST-body-only nested write is invisible here for
-# the same reason the batch/v1-in-body case is (see header).
-n_nestedwrite=$(access_stream | grep -i 'batch/v1' | grep -icE 'wp/v2/users|wp/v2/plugins' || true)
+# the same reason the batch/v1-in-body case is (see header). Extracts just
+# the matched request-line substring first (same anchored pattern as
+# n_batch above), then checks for the nested sub-request path within THAT,
+# not the whole log line — same false-positive class this whole block
+# guards against otherwise.
+n_nestedwrite=$(access_stream | grep -oE "$BATCH_V1_REQUEST_RE" | grep -icE 'wp/v2/users|wp/v2/plugins' || true)
 report "nested privileged REST write in batch request (GET-based only)" "$n_nestedwrite"
 
 echo
@@ -605,6 +620,19 @@ else
     plugins_raw=$($WP_CLI plugin list --status=active --fields=name,title --format=csv --skip-plugins --skip-themes 2>/dev/null || true)
     plugins=$(sanitize_query_result "$plugins_raw" "active plugins list" "$WP_CLI plugin list --status=active --fields=name,title --format=csv --skip-plugins --skip-themes")
     [[ -n "$plugins" ]] && printf '%s\n' "$plugins"
+
+    # A custom post_status this specific — same as a plugin's — can just as
+    # easily be registered in a theme's functions.php, not only via a
+    # plugin/mu-plugin (confirmed directly: a real site's flagged status
+    # traced back to a theme-defined CPT, which the plugin list above has
+    # no way to explain). Shows every installed theme, not just the active
+    # one, since a child theme's parent (WP-CLI's own "parent" status) is
+    # exactly where that kind of registration code often actually lives.
+    echo
+    echo "== installed themes for post_status cross-reference (see status column for active/parent) =="
+    themes_raw=$($WP_CLI theme list --fields=name,title,status --format=csv --skip-plugins --skip-themes 2>/dev/null || true)
+    themes=$(sanitize_query_result "$themes_raw" "installed themes list" "$WP_CLI theme list --fields=name,title,status --format=csv --skip-plugins --skip-themes")
+    [[ -n "$themes" ]] && printf '%s\n' "$themes"
   fi
 
   # Not filtered by post_status: a forged changeset can sit in any status
@@ -731,8 +759,21 @@ echo "== Summary: $pass ok, $flag flagged =="
 
 ### --- Build the report, save/print it, and optionally publish -------------
 
-if [[ "$n_invalid" -gt 0 || "$n_changesets" -gt 0 || "$n_navmenu" -gt 0 || "$n_postmeta" -gt 0 || "$n_sqli" -gt 0 || "$n_suspusers" -gt 0 ]]; then
+# invalid_post_status is deliberately NOT in the same bucket as the other
+# five checks below: unlike them, it has a documented, real-world false-
+# positive path — a plugin's or theme's own custom post_status values
+# (WooCommerce order statuses being the confirmed example; a theme-defined
+# CPT's status is the same shape) — which is exactly why the post_status
+# breakdown/cross-reference review (SKILL.md Stage 2b) exists. Firing
+# "CONFIRMED COMPROMISE" on that check alone, before that review ever
+# happens, produced a false confirmed-compromise verdict on a real site
+# whose custom post type was defined in its theme rather than a plugin.
+# If any of the five unambiguous checks are also non-zero, invalid
+# post_status corroborates them and the confirmed verdict still stands.
+if [[ "$n_changesets" -gt 0 || "$n_navmenu" -gt 0 || "$n_postmeta" -gt 0 || "$n_sqli" -gt 0 || "$n_suspusers" -gt 0 ]]; then
   VERDICT="CONFIRMED COMPROMISE — remediation required"
+elif [[ "$n_invalid" -gt 0 ]]; then
+  VERDICT="REQUIRES REVIEW — anomalous post_status values found"
 else
   VERDICT="NO EVIDENCE OF COMPROMISE FOUND"
 fi
@@ -782,7 +823,7 @@ This report covers CVE-2026-60137 (unauthenticated SQL injection via \`author__n
 
 **Verdict: ${VERDICT}**
 
-The six highest-confidence indicators — invalid \`post_status\` rows, forged \`customize_changeset\` rows, forged \`nav_menu_item\` rows, malicious \`postmeta\` rows referencing \`example.invalid\`, \`author__not_in\` SQLi errors, and \`<prefix>_<hex>\`-style usernames — are independent and mutually corroborating when non-zero. All other checks are supporting evidence only; see per-section assessments below.
+Five checks are unambiguous on their own and independent/mutually corroborating when non-zero: forged \`customize_changeset\` rows, forged \`nav_menu_item\` rows, malicious \`postmeta\` rows referencing \`example.invalid\`, \`author__not_in\` SQLi errors, and \`<prefix>_<hex>\`-style usernames. Invalid \`post_status\` rows are one step behind those five — a plugin's or theme's own custom status (WooCommerce order statuses, or a theme-registered custom post type, are both confirmed real-world examples) can produce this same signal with no compromise at all, which is why a nonzero count here alone yields **REQUIRES REVIEW** rather than a confirmed verdict; see the \`== post_status breakdown for anomaly review ==\` block and Section 4's assessment before treating it as compromise. If invalid \`post_status\` co-occurs with any of the five unambiguous checks, it corroborates them and the verdict is CONFIRMED. All other checks are supporting evidence only; see per-section assessments below.
 
 ---
 

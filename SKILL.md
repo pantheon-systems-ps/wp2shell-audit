@@ -70,16 +70,16 @@ A `user_login`/`display_name` matching the `<prefix>_<hex>` regex is not automat
 
 ## Stage 2b — post_status breakdown review (only if invalid `post_status` is non-zero)
 
-If Section 4's `wp_posts` with invalid `post_status` count is non-zero, check the `== post_status breakdown for anomaly review ==` block (also printed to stdout, not written to the report — distinct status values with row counts, not per-row IDs) against the `== active plugins for post_status cross-reference ==` block printed right after it, before treating it as compromise:
+The audit already reflects this: a nonzero invalid-`post_status` count alone yields **REQUIRES REVIEW**, not a confirmed verdict, in the report itself — this stage is that review. If Section 4's `wp_posts` with invalid `post_status` count is non-zero, check the `== post_status breakdown for anomaly review ==` block (also printed to stdout, not written to the report — distinct status values with row counts, not per-row IDs) against the `== active plugins for post_status cross-reference ==` **and** `== installed themes for post_status cross-reference ==` blocks printed right after it, before treating it as compromise:
 
-- **Match the status prefix/name to an actual active plugin in that list, don't just judge the naming "plausible."** A status like `fgf_automatic` is meaningless on its own — check whether an active plugin's name/slug corresponds to that prefix (e.g. a plugin literally named or abbreviating to "fgf") and name that specific plugin in your write-up if so. "Looks like it could be a plugin" without checking the actual list is a guess, not a finding.
-- A status that matches an active plugin, covering many rows (dozens to hundreds of thousands) — that plugin's own post type or workflow. Not evidence of compromise.
-- A status with **no corresponding active plugin**, especially on exactly one or two rows, or one that looks like random/injected text — the suspicious case. Note explicitly that no installed plugin explains it.
+- **Match the status prefix/name to an actual active plugin OR installed theme, don't just judge the naming "plausible."** A status like `fgf_automatic` is meaningless on its own — check whether an active plugin's name/slug, *or* a theme's (its own custom post types are commonly registered in `functions.php`, not just via a plugin/mu-plugin — a real site's flagged status has traced back to exactly this), corresponds to that prefix, and name that specific plugin/theme in your write-up if so. "Looks like it could be a plugin" without checking the actual lists is a guess, not a finding.
+- A status that matches an active plugin or an installed theme, covering many rows (dozens to hundreds of thousands) — that plugin's/theme's own post type or workflow. Not evidence of compromise.
+- A status with **no corresponding active plugin or installed theme**, especially on exactly one or two rows, or one that looks like random/injected text — the suspicious case. Note explicitly that nothing installed explains it.
 
 **Calibration:**
 
 > `wc-partial-refund: 340, wc-backorder: 12`, active plugins include `woocommerce` — normal: matches an actually-installed plugin, meaningful row counts across real store data.
-> `xk29_temp: 1`, no plugin in the active list corresponds to `xk29` — flagged: single row, nothing installed explains this status.
+> `xk29_temp: 1`, no plugin or theme in either list corresponds to `xk29` — flagged: single row, nothing installed explains this status.
 
 State which specific plugin (or its absence) a status corresponds to — don't flag or clear on a hunch. A single common WooCommerce status like `wc-completed` can account for hundreds of thousands of legitimate rows on an active store — that scale is exactly why this cross-reference step exists rather than treating any non-core status as a flag.
 
