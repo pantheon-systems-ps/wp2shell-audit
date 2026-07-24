@@ -63,6 +63,16 @@
 #           highest-value target on a compromised network). Without this
 #           flag, a multisite install only ever gets its main site (blog 1)
 #           checked — every subsite's own tables are silently skipped.
+# --trust-new-hosts  Opt-in only, only relevant to --site mode. Off by
+#           default: an appserver whose SSH host key isn't already known
+#           makes the connection to it fail (loudly, with the IP named) —
+#           that appserver's logs are then missing from this audit, same as
+#           any other unreachable appserver. Pass this flag to scan and
+#           accept a new host key so the fetch can proceed; the accepted
+#           key is scoped to a throwaway file for this run only (never
+#           written to your real ~/.ssh/known_hosts) and the exact host/key
+#           fingerprint being trusted is printed so it's not a silent
+#           decision.
 #
 # Also prints (not included in the report) the site's 100 most recently
 # registered users, plus a separate list of every administrator-role
@@ -87,6 +97,8 @@ OUTPUT_DIR=""
 STDOUT_ONLY=0
 DO_GWS=0
 MULTISITE=0
+TRUST_NEW_HOSTS=0
+KNOWN_HOSTS_TMP=""
 
 # Only cleans up the terminus logs tempdir — MD_FILE is Stage 1's actual
 # deliverable now (SKILL.md Stage 2/3 read and edit it before publishing),
@@ -102,6 +114,9 @@ cleanup() {
   fi
   if [[ -n "$QUERY_FAILURE_MARKER" ]]; then
     rm -f "$QUERY_FAILURE_MARKER"
+  fi
+  if [[ -n "$KNOWN_HOSTS_TMP" ]]; then
+    rm -f "$KNOWN_HOSTS_TMP"
   fi
 }
 trap cleanup EXIT
@@ -124,6 +139,7 @@ while [[ $# -gt 0 ]]; do
     --stdout) STDOUT_ONLY=1; shift ;;
     --gws)    DO_GWS=1; shift ;;
     --multisite) MULTISITE=1; shift ;;
+    --trust-new-hosts) TRUST_NEW_HOSTS=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -173,6 +189,7 @@ fetch_all_appserver_logs() {
   local site_name="$1" site_env="$2" dest="$3"
   local uuid host ips ip ok=0 failed=0
   local missing=()
+  local scanned_key fingerprint strict_mode
 
   for tool in dig rsync nc ssh; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
@@ -198,16 +215,41 @@ fetch_all_appserver_logs() {
     return 1
   fi
 
+  # Host-key trust is scoped to this run-local file, never the operator's
+  # real ~/.ssh/known_hosts — nothing here persists past cleanup() at exit.
+  # Without --trust-new-hosts, StrictHostKeyChecking=yes against this
+  # (empty) file means an appserver whose key isn't already known fails the
+  # connection outright rather than silently auto-accepting it, which
+  # matters on a machine used for incident response against a possibly
+  # compromised environment (GitHub issue: trust-on-first-error is a poor
+  # default, and writing to the real known_hosts made it persist beyond
+  # the run).
+  KNOWN_HOSTS_TMP=$(mktemp)
+
   while read -r ip; do
     [[ -z "$ip" ]] && continue
-    ssh-keyscan -p 2222 -H "$ip" >> ~/.ssh/known_hosts 2>/dev/null
     mkdir -p "${dest}/appserver-${ip}"
-    if rsync -rlz -e "ssh -p 2222 -o ProxyCommand='nc ${ip} 2222' -o StrictHostKeyChecking=accept-new" \
+    if [[ "$TRUST_NEW_HOSTS" -eq 1 ]]; then
+      scanned_key=$(ssh-keyscan -p 2222 -H "$ip" 2>/dev/null || true)
+      if [[ -n "$scanned_key" ]]; then
+        printf '%s\n' "$scanned_key" >> "$KNOWN_HOSTS_TMP"
+        fingerprint=$(printf '%s\n' "$scanned_key" | ssh-keygen -lf - 2>/dev/null || true)
+        echo "  [trust] appserver ${ip}: accepting new host key for THIS RUN ONLY (not written to ~/.ssh/known_hosts): ${fingerprint}" >&2
+      fi
+      strict_mode="accept-new"
+    else
+      strict_mode="yes"
+    fi
+    if rsync -rlz -e "ssh -p 2222 -o ProxyCommand='nc ${ip} 2222' -o UserKnownHostsFile=${KNOWN_HOSTS_TMP} -o StrictHostKeyChecking=${strict_mode}" \
         "${site_env}.${uuid}@${host}:logs/" "${dest}/appserver-${ip}/" >&2 2>&1; then
       ok=$((ok + 1))
     else
       failed=$((failed + 1))
-      echo "  [warn] appserver ${ip}: rsync failed — this appserver's logs are MISSING from this audit, not counted as clean" >&2
+      if [[ "$TRUST_NEW_HOSTS" -eq 1 ]]; then
+        echo "  [warn] appserver ${ip}: rsync failed — this appserver's logs are MISSING from this audit, not counted as clean" >&2
+      else
+        echo "  [warn] appserver ${ip}: rsync failed — likely an unrecognized SSH host key rejected by design (pass --trust-new-hosts to scan and accept it for this run only). This appserver's logs are MISSING from this audit, not counted as clean" >&2
+      fi
     fi
   done <<< "$ips"
 

@@ -108,6 +108,14 @@ This is handled, not just detected:
 - **Every other DB check**: if a query's output still looks contaminated after that, the result is treated as `0, unknown` — not silently counted as `0, confirmed clean`. A `WARNING: query for '<check>' failed or produced a PHP warning/notice` line is printed (stdout/terminal) identifying exactly which check, immediately followed by a `Spot-check manually: <exact wp-cli command>` line — the same query, ready to paste and re-run by hand to confirm the true answer wasn't silently swallowed.
 - **The saved report**: since a saved `--output` file (or a published Google Doc) only ever shows the numeric count — indistinguishable from a real zero — Section 5 (Confidence Assessment) gets an explicit callout whenever any check was affected, so this is visible even to someone who never saw the original terminal output.
 
+### SSH host-key trust (`--site` mode)
+
+Fetching logs requires connecting to appservers whose SSH host key this script has never seen before. By default it does **not** trust a new key — the connection to that appserver fails loudly, naming the IP and suggesting the flag below, and that appserver's logs are simply missing from the audit (same as any other unreachable appserver).
+
+Pass `--trust-new-hosts` to scan and accept an unknown appserver's host key so the fetch can proceed. That trust is scoped to a throwaway, run-local file — never written to your real `~/.ssh/known_hosts`, and gone once the script exits — and the exact host/key fingerprint being accepted is printed so it's never a silent decision.
+
+**Known limitation:** this only covers the log-fetch step. `terminus wp SITE.ENV -- <command>` (used for every DB check) opens its own SSH connection internally, managed entirely by Terminus, which appears to trust-on-first-connect against your real `~/.ssh/known_hosts` regardless of this flag — not something this script can control. If a site's appserver key is genuinely new, expect one entry to land in your real `known_hosts` from that path even with default settings here.
+
 ## Scope
 
 This is audit-only. It does not delete, patch, or remediate anything on the target site.
