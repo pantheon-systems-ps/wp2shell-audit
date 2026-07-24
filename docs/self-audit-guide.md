@@ -1,6 +1,6 @@
 # Self-Audit Guide: Checking Your WordPress Site for the wp2shell Vulnerability Chain (CVE-2026-60137 / CVE-2026-63030)
 
-**Scope: This guide is for detection only.** It does not cover remediation. If any step below flags a positive result, stop and contact Pantheon Support or your security team before taking any action — do not delete users, posts, or files based on this guide alone.
+**Scope: This guide is for detection only.** It does not cover remediation.
 
 This guide walks through the same checks as `scripts/wp2shell-audit.sh`, done by hand — no script download, no Claude, just WP-Admin and copy-pasteable Terminus commands. If you'd rather run the script itself, see the main [README](../README.md).
 
@@ -190,9 +190,3 @@ terminus wp <site>.<env> -- db query "
 This returns one PHP-serialized value, not a clean list — look for `s:<length>:"<username>"` entries inside it; each one is a Super Admin's username. Every WPMS network has at least one (normal), but review the full list the same way you'd review the administrator list above — a name that doesn't belong is the highest-priority finding this guide can produce.
 
 The orphaned-usermeta and throwaway-username checks from Step 4 don't need repeating — `wp_users`/`wp_usermeta` are shared network-wide, not per-subsite, so those two queries already covered every subsite in one pass.
-
-## Step 5: If anything comes back positive
-
-- Do not delete the flagged posts, users, or accounts yourself.
-- Do not attempt to patch, restore, or roll back on your own based on this guide.
-- Contact Pantheon Support (or your Pantheon Professional Services contact) with the specific IDs/rows returned, so a full incident review and safe remediation can be scoped.
