@@ -12,10 +12,10 @@ Works three ways:
 ## Prerequisites
 
 - [`terminus`](https://docs.pantheon.io/terminus/install) installed and authenticated (`terminus auth:login`), with access to the target site.
-- `dig`, `rsync`, `nc`, and `ssh` (only needed for `--site` mode) — used to fetch logs directly from every appserver backing the environment. **Not** `terminus logs:get`/the `terminus-site-debug` plugin: that plugin rsyncs straight to a resolved appserver IP, but Pantheon's SSH gateway routes by hostname, so it fails outright (confirmed directly: exit 255 on every attempt) — and even when it does work, an environment can be backed by many appserver containers at once (confirmed directly: one real site resolved to 16), each with a different slice of traffic and log-rotation history, so reaching only one can silently miss the actual incident. Not needed for `--logs` mode (already-downloaded logs).
+- `dig`, `rsync`, `nc`, and `ssh` — used to fetch logs directly from every appserver backing the environment when running with `--site` (the normal way this is used). Not needed if you're running against already-downloaded logs via `--logs` instead.
 - [`gws`](https://github.com/googleworkspace/cli) installed and authenticated — **only if** you want to publish a Google Doc (`--gws`). The audit itself never requires it and doesn't check for it unless you pass `--gws`.
 - `python3` (only needed for publishing — see above).
-- `bash`, standard Unix tools (`grep`, `awk`, `gzip`, etc.) — nothing exotic.
+- `bash`, standard Unix tools (`grep`, `awk`, `gzip`, etc.).
 
 ## Option A: Use it as a Claude Code skill
 
@@ -72,10 +72,14 @@ scripts/
 
 - **Nginx access log**: `batch/v1` REST route hits, `author_exclude` SQLi payloads (non-numeric values, including the `author.exclude`/`author exclude` WAF-evasion spellings), nested privileged REST writes via batch — e.g. `wp/v2/users`/`wp/v2/plugins` co-occurring with `batch/v1` (GET-based variant only), `wp-admin` plugin-upload POSTs, `delete_user=` calls, a wp-login IP-hop heuristic, WordPress self-request UA/version fingerprinting, non-browser version-fingerprint requests.
 - **PHP error log** (requires `WP_DEBUG_LOG`-style verbose logging to have been on at the time): `author__not_in` SQL injection errors, nested REST dispatch signature, changeset-publish pipeline stall marker.
-- **Database** (requires `--wp`/`--site`): posts with an invalid `post_status` (whitelist includes WooCommerce's standard order statuses — confirmed directly that without this, an active store's legitimate orders produce a large false positive; a `post_status` breakdown block is printed for anything else non-standard, for a judgment call rather than an automatic flag), forged `customize_changeset` rows (any status), forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, orphaned `usermeta` rows, `<prefix>_<hex>`-style throwaway-admin usernames, and a full list of administrator-role accounts by registration date (for prioritizing the anomaly review).
+- **Database** (requires `--wp`/`--site`): posts with an invalid `post_status` (the whitelist includes WooCommerce's standard order statuses, since those can cover hundreds of thousands of legitimate rows on an active store; a `post_status` breakdown block is printed for anything else non-standard, for a judgment call rather than an automatic flag), forged `customize_changeset` rows (any status), forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, orphaned `usermeta` rows, `<prefix>_<hex>`-style throwaway-admin usernames, and a full list of administrator-role accounts by registration date (for prioritizing the anomaly review).
 
 The database checks are the highest-confidence signal — none of them depend on log retention or debug-logging configuration, and WordPress cannot produce these specific results through normal operation. Standard nginx access logs never capture POST body content, so any of the above sent entirely inside a POST body (rather than the URL/query string) is invisible to the nginx-log checks — that's a data-source limit, not a gap a different grep would close.
 
 ## Scope
 
 This is audit-only. It does not delete, patch, or remediate anything on the target site.
+
+## License
+
+[MIT](LICENSE) — fork it, modify it, adapt it to your own environment as needed.

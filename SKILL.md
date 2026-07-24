@@ -18,7 +18,7 @@ Clone or copy this repo into `~/.claude/skills/wp2shell-audit/` (personal, all p
 ## Prerequisites
 
 - `terminus` CLI installed and authenticated (`terminus auth:login`), with access to the target site.
-- `dig`, `rsync`, `nc`, and `ssh` (only needed for `--site` mode) — Stage 1 fetches logs directly from every appserver backing the environment, not via `terminus logs:get`/the `terminus-site-debug` plugin (that plugin rsyncs to a resolved appserver IP, but Pantheon's SSH gateway routes by hostname, so it fails outright — confirmed directly — and even when it works, reaching only one of an environment's possibly-many appservers can silently miss the incident). Not needed for `--logs` mode.
+- `dig`, `rsync`, `nc`, and `ssh` — Stage 1 fetches logs directly from every appserver backing the environment when running with `--site` (the normal way this is used). Not needed for `--logs` mode.
 - `gws` CLI installed and authenticated — **only needed if you (or the user) actually want a Google Doc published (Stage 3).** Stages 1 and 2 never require it — don't install it, mention it, or treat it as blocking unless a Google Doc was actually requested. Confirm Stage 3 readiness with `gws drive about get --params '{"fields":"user"}'` when you get there.
 - `python3` for the doc generator (`scripts/lib/generate_google_doc.py`, bundled in this repo — no external framework needed) — same Stage-3-only scope as `gws`.
 
@@ -61,7 +61,7 @@ State which specific pattern a flagged account breaks — don't flag on a hunch.
 > `142:jsmith2024:jsmith2024@gmail.com:2026-03-11` — normal: name-derived login, plausible address, unremarkable date.
 > `98:x7f2a9b1c4d:x7f2a9b1c4d@mailinator.com:2026-07-21` — flagged: login is a bare hex string with no name relation, email domain is a known disposable-mail provider, and the registration date lands the same day as this audit.
 
-A `user_login`/`display_name` matching the `<prefix>_<hex>` regex is not automatically suspicious on its own — apply the same three criteria above before flagging it, not the raw regex match. A real-name-derived login with a random suffix (e.g. `janedoe_a1b2c3`), a real consumer email domain (gmail/yahoo/outlook, not disposable), registration spread across months rather than clustered, and no administrator role — that's a normal auto-generated customer/membership username from an e-commerce or membership plugin, not a throwaway admin account. Confirmed directly: a site's own "suspicious usernames" regex match turned out to be exactly this — 16 real-looking customer accounts, non-admin, registered across 5 months, on real email providers.
+A `user_login`/`display_name` matching the `<prefix>_<hex>` regex is not automatically suspicious on its own — apply the same three criteria above before flagging it, not the raw regex match. A real-name-derived login with a random suffix (e.g. `janedoe_a1b2c3`), a real consumer email domain (gmail/yahoo/outlook, not disposable), registration spread across months rather than clustered, and no administrator role — that's a normal auto-generated customer/membership username from an e-commerce or membership plugin, not a throwaway admin account. For example: a site's own "suspicious usernames" regex match can turn out to be exactly this — real-looking customer accounts, non-admin, registered across several months, on real email providers.
 
 ## Stage 2b — post_status breakdown review (only if invalid `post_status` is non-zero)
 
@@ -76,7 +76,7 @@ If Section 4's `wp_posts` with invalid `post_status` count is non-zero, check th
 > `wc-partial-refund: 340, wc-backorder: 12`, active plugins include `woocommerce` — normal: matches an actually-installed plugin, meaningful row counts across real store data.
 > `xk29_temp: 1`, no plugin in the active list corresponds to `xk29` — flagged: single row, nothing installed explains this status.
 
-State which specific plugin (or its absence) a status corresponds to — don't flag or clear on a hunch. Confirmed directly: a real WooCommerce site's `wc-completed` status alone accounted for 224,000+ of a 231,501-row false positive before this whitelist/review step existed.
+State which specific plugin (or its absence) a status corresponds to — don't flag or clear on a hunch. A single common WooCommerce status like `wc-completed` can account for hundreds of thousands of legitimate rows on an active store — that scale is exactly why this cross-reference step exists rather than treating any non-core status as a flag.
 
 ## Stage 3 — merge findings, and publish only if asked (optional)
 
