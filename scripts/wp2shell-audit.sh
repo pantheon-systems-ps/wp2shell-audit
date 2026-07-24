@@ -133,10 +133,29 @@ fi
 # by filename pattern (not a fixed path), so nothing else needs to change
 # to pick up every appserver's logs once they're all fetched here.
 #
-# Requires: dig, rsync, nc, ssh — standard tools, no Terminus plugin.
+# Requires: dig, rsync, nc, ssh — standard tools, no Terminus plugin. Minimal
+# Docker/Lando dev containers commonly lack dig and nc specifically (rsync
+# and ssh are more often already present) — confirmed directly: a stock
+# Lando appserver container had neither. Without this check, a missing `dig`
+# makes the lookup below fail silently (empty output, stderr suppressed) and
+# produces the exact same "No appserver DNS records found" message as a
+# genuinely missing environment — misleading, since the site/environment is
+# actually fine. Check up front so the real problem is reported plainly.
 fetch_all_appserver_logs() {
   local site_name="$1" site_env="$2" dest="$3"
   local uuid host ips ip ok=0 failed=0
+  local missing=()
+
+  for tool in dig rsync nc ssh; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Missing required tool(s) for --site mode: ${missing[*]}." >&2
+    echo "This is common in minimal Docker/Lando dev containers. Install them and retry — e.g. on Debian/Ubuntu-based containers:" >&2
+    echo "  apt-get update && apt-get install -y dnsutils rsync netcat-openbsd openssh-client" >&2
+    echo "For Lando specifically, add a build_as_root step to .lando.yml (a one-off apt-get inside the container won't survive a rebuild) — see README." >&2
+    return 1
+  fi
 
   uuid=$(terminus site:info "$site_name" --field=id 2>/dev/null)
   if [[ -z "$uuid" ]]; then

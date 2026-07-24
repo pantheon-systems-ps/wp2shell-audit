@@ -12,7 +12,14 @@ Works three ways:
 ## Prerequisites
 
 - [`terminus`](https://docs.pantheon.io/terminus/install) installed and authenticated (`terminus auth:login`), with access to the target site.
-- `dig`, `rsync`, `nc`, and `ssh` — used to fetch logs directly from every appserver backing the environment when running with `--site` (the normal way this is used). Not needed if you're running against already-downloaded logs via `--logs` instead.
+- `dig`, `rsync`, `nc`, and `ssh` — used to fetch logs directly from every appserver backing the environment when running with `--site` (the normal way this is used). Not needed if you're running against already-downloaded logs via `--logs` instead. `--site` checks for all four up front and tells you exactly which are missing rather than failing with a confusing DNS error. Minimal Docker/Lando dev containers commonly lack `dig`/`nc` specifically — on Debian/Ubuntu-based ones: `apt-get install -y dnsutils rsync netcat-openbsd openssh-client`. In a Lando project, add that as a `build_as_root` step in `.lando.yml` so it survives `lando rebuild` (a one-off `lando ssh -u root -c "apt-get install ..."` does not):
+  ```yaml
+  services:
+    appserver:
+      build_as_root:
+        - apt-get update -y
+        - apt-get install -y dnsutils rsync netcat-openbsd openssh-client
+  ```
 - [`gws`](https://github.com/googleworkspace/cli) installed and authenticated — **only if** you want to publish a Google Doc (`--gws`). The audit itself never requires it and doesn't check for it unless you pass `--gws`.
 - `python3` (only needed for publishing — see above).
 - `bash`, standard Unix tools (`grep`, `awk`, `gzip`, etc.).
