@@ -359,6 +359,49 @@ error_log() {
   done
 }
 
+# --- Exploit-attempt timeline scan ----------------------------------------
+# Single pass over the access stream computing first|last|count for three
+# buckets, so the timeline does not multiply the script's gzip-decompression
+# cost (re-streaming the rotated logs once per check is the dominant expense):
+#   ATTEMPT — payload-shaped signatures only: non-numeric author_exclude
+#             values, nested privileged writes inside a batch request, and
+#             wp-admin plugin-upload POSTs. This is what feeds the
+#             backup-restore-point boundary.
+#   BATCH   — raw batch/v1 hits. Reported separately and NOT folded into the
+#             boundary: this route is dominated by legitimate REST/Jetpack/
+#             mobile traffic (thousands of benign hits spanning months on a
+#             real site), so its earliest timestamp is not an attack marker.
+#   LOG     — overall access-log span, for the log-retention caveat.
+# Timestamps are UTC (Pantheon nginx logs are UTC — no tz conversion). The
+# sort key is numeric yyyymmddHHMMSS because the raw dd/Mon/yyyy token is not
+# lexically sortable. BSD/macOS awk only — no gawk-specific gensub/IGNORECASE.
+# The author_exclude value is read from the original line up to the next
+# & / quote / space, then tested for non-numeric content (a legitimate
+# author_exclude=1,2,3 — %2c/%2C being the URL-encoded comma — is skipped),
+# mirroring the count check's own numeric exclusion.
+attempt_scan() {
+  awk '
+    function upd(b,key,disp){ if(!(b in cnt)||key<mnk[b]){mnk[b]=key;mnd[b]=disp}
+                              if(!(b in cnt)||key>mxk[b]){mxk[b]=key;mxd[b]=disp}; cnt[b]++ }
+    BEGIN{ split("jan feb mar apr may jun jul aug sep oct nov dec",M," ");
+           for(i=1;i<=12;i++) mn[M[i]]=sprintf("%02d",i) }
+    { ts=$4; sub(/^\[/,"",ts); mo=tolower(substr(ts,4,3)); if(mn[mo]=="") next
+      key=substr(ts,8,4) mn[mo] substr(ts,1,2) substr(ts,13,2) substr(ts,16,2) substr(ts,19,2)
+      disp=substr(ts,8,4)"-"mn[mo]"-"substr(ts,1,2)" "substr(ts,13,8)" UTC"
+      upd("LOG",key,disp)
+      low=tolower($0)
+      if(index(low,"?rest_route=/batch/v1")||index(low,"/wp-json/batch/v1")) upd("BATCH",key,disp)
+      a=0
+      if(low ~ /author[._+]exclude=/ || index(low,"author%20exclude=")){
+        p=index(low,"exclude="); rest=substr($0,p+8); n=length(rest); val=""
+        for(i=1;i<=n;i++){c=substr(rest,i,1); if(c=="&"||c=="\""||c==" ")break; val=val c}
+        t=val; gsub(/%2[cC]/,",",t); if(t !~ /^[0-9,]*$/) a=1 }
+      if(index(low,"batch/v1") && (index(low,"wp/v2/users")||index(low,"wp/v2/plugins"))) a=1
+      if(index(low,"update.php?action=upload-plugin")) a=1
+      if(a) upd("ATTEMPT",key,disp) }
+    END{ for(b in cnt) printf "%s|%s|%s|%d\n", b, mnd[b], mxd[b], cnt[b] }'
+}
+
 echo "== wp2shell audit: $LOG_DIR =="
 echo
 
@@ -408,6 +451,49 @@ report "author_exclude SQLi payload (non-numeric value)" "$n_authorexcl" $author
 # the same reason the batch/v1-in-body case is (see header).
 n_nestedwrite=$(access_stream | grep -i 'batch/v1' | grep -icE 'wp/v2/users|wp/v2/plugins' || true)
 report "nested privileged REST write in batch request (GET-based only)" "$n_nestedwrite"
+
+# --- Exploit-attempt time window (backup restore-point boundary) ----------
+# One pass over the access stream → per-bucket "first|last|count" (see
+# attempt_scan above). Lets a site owner identify a backup taken before any
+# observed attempt. Bounded by log retention and access-log-visible attempts
+# only (POST bodies are not logged) — the report wording states both caveats.
+SCAN=$(access_stream | attempt_scan || true)
+ATTEMPT_WINDOW=""; BATCH_WINDOW=""; LOG_WINDOW=""
+while IFS='|' read -r _b _f _l _c; do
+  [[ -z "$_b" ]] && continue
+  case "$_b" in
+    ATTEMPT) ATTEMPT_WINDOW="$_f|$_l|$_c" ;;
+    BATCH)   BATCH_WINDOW="$_f|$_l|$_c" ;;
+    LOG)     LOG_WINDOW="$_f|$_l|$_c" ;;
+  esac
+done <<< "$SCAN"
+
+# Split "first|last|count" into fields for the buckets we display.
+AF=""; AL=""; AN=""
+LF=${LOG_WINDOW%%|*}; _lr=${LOG_WINDOW#*|}; LL=${_lr%%|*}
+BF=${BATCH_WINDOW%%|*}; _br=${BATCH_WINDOW#*|}; BL=${_br%%|*}
+
+# Precompute the Section 2 markdown block here (plain shell context), then
+# drop it into the report heredoc below via a simple ${ATTEMPT_BLOCK}
+# expansion. Built by string concatenation rather than a `$(cat <<HEREDOC)` —
+# a here-document nested inside command substitution is mis-parsed by the
+# bash that ships with macOS, and derails the whole report write. Backticks
+# are escaped so they land as literal characters in the value.
+nl=$'\n'
+if [[ -n "$ATTEMPT_WINDOW" ]]; then
+  AF=${ATTEMPT_WINDOW%%|*}; _r=${ATTEMPT_WINDOW#*|}; AL=${_r%%|*}; AN=${_r##*|}
+  echo
+  echo "== Exploit-attempt time window (access-log-visible) =="
+  echo "Earliest attack-payload request: $AF"
+  echo "Latest attack-payload request:   $AL   ($AN request(s))"
+  echo "=> Backups taken before $AF predate all attempt traffic visible in the retained logs."
+  ATTEMPT_BLOCK="- **Earliest attack-payload request:** ${AF}${nl}"
+  ATTEMPT_BLOCK+="- **Latest attack-payload request:** ${AL} (${AN} request(s): non-numeric \`author_exclude\` payloads, nested privileged writes, and plugin-upload POSTs)${nl}"
+  ATTEMPT_BLOCK+="- **Restore-point guidance:** a backup captured **before ${AF}** predates every exploit attempt visible in the retained nginx logs.${nl}${nl}"
+  ATTEMPT_BLOCK+="_Caveats:_ (1) **Bounded by log retention** — \`terminus logs:get\` returns only the retained rotated logs (the overall access-log span in this fetch is ${LF} → ${LL}); an attempt older than the oldest retained line would not appear here, so read this as \"no *visible* attempt before this,\" not proof of none. (2) **Attempt ≠ compromise** — this is an attempt boundary, not a compromise boundary; see Section 4 for whether any attempt succeeded. A clean Section 4 with attempts present means the attempts were observed but did not compromise the site. (3) **POST bodies are not logged** by nginx (see Section 5), so this window reflects access-log-visible attempts only. (4) Raw \`batch/v1\` hits are **excluded** from this boundary because they are dominated by legitimate REST/Jetpack/mobile traffic; that route's mixed-traffic span in this fetch is ${BF} → ${BL}."
+else
+  ATTEMPT_BLOCK="(no access-log-visible exploit-attempt signatures detected)"
+fi
 
 echo
 
@@ -740,6 +826,9 @@ $(md_list $vers)
 
 **\`author_exclude\` payload values found:**
 $(md_list $authorexcl)
+
+**Exploit-attempt time window (access-log-visible):**
+${ATTEMPT_BLOCK}
 
 **Assessment:** prior to this CVE's disclosure, the \`batch/v1\` route had near-zero legitimate traffic platform-wide — elevated volume here should be read as a real signal leaning toward attack/probe activity, not dismissed as plausibly-organic REST/Jetpack/mobile-client usage. \`wp-admin\` upload POSTs, \`delete_user=\` calls, and the wp-login-first-try pattern are the direct nginx-side fingerprint of the later RCE/webshell stage seen in prior confirmed exploitation of this chain — zero here means no nginx-log evidence the attack reached that stage, not proof it didn't (see confidence notes below). The \`author_exclude\` check catches the SQLi payload itself (not just its PHP-error side effect in Section 3) and also matches the \`author.exclude\`/\`author exclude\` spellings an attacker can use to dodge a WAF rule written against the literal string \`author_exclude\` — PHP folds all three into the same request parameter when parsing. The nested-privileged-write check only catches a GET-based batch call with sub-request paths in the query string; a POST-body variant of either this or the raw \`batch/v1\` hit itself is invisible to nginx access logs, which do not capture POST body content — a zero on either of these two checks is not evidence the technique wasn't attempted, only that it wasn't attempted in a form the access log can see.
 
