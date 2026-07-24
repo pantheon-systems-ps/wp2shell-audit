@@ -48,6 +48,8 @@ Output includes:
 - A block labeled `== Administrator-role accounts for anomaly review ==`: every account holding the administrator role, by registration date — check these first, a nonzero count is normal (every site has admins), it's a priority list, not a flag. With `--multisite`, this covers admins on every subsite (tagged by which capability key/blog matched), not just the main site — a subsite-only admin is otherwise invisible.
 - **With `--multisite` only**: `== Network Super Admin accounts for anomaly review ==` — accounts with network-wide Super Admin status (full control over every subsite). Check this block *first*, before the regular administrator list — a planted Super Admin is the highest-value target on a compromised multisite network.
 
+If any `WARNING: query for '<check>' failed or produced a PHP warning/notice` lines appear (usually from a site's `wp-config.php` printing noise to stdout on every WP-CLI bootstrap), the affected check's count is `0, unknown` — not confirmed clean. Never describe that check as clean in your own write-up; the saved report itself also carries an explicit Section 5 callout when this happened, so check there too if you're reading a report instead of live terminal output. Each such warning is followed by a `Spot-check manually: <command>` line — if the user wants extra confidence on a specific check, that's a ready-to-run command, not something you need to reconstruct yourself.
+
 ## Stage 2 — user-account anomaly review
 
 If this was run with `--multisite`, check `== Network Super Admin accounts for anomaly review ==` first — full network control is a bigger prize than any single subsite's admin role. Then check `== Administrator-role accounts for anomaly review ==` — a planted admin account is the highest-value target for this pattern of attack. Then read the `== Recent user accounts for anomaly review ==` block. Look for accounts that break the pattern of the rest of the list:
@@ -108,3 +110,4 @@ This produces exactly one doc per audit, containing both stages, with no local f
 - Always confirm a report destination (`--output` dir, or `--stdout`) before running Stage 1 — ask if the user hasn't said.
 - The generator does not share the doc with anyone — it's private to whoever's `gws` credentials created it. Share it yourself once it's published.
 - There is no cover page or logo in the generated doc by design.
+- A `0` in Section 4 of the report is not automatically "confirmed clean" — check Section 5 (Confidence Assessment) for a query-failure callout first (see Stage 1's output notes above) before treating a clean-looking Database section as verified.

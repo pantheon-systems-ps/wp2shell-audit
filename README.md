@@ -99,6 +99,15 @@ By default, only the main site (blog ID 1) gets checked — a multisite install'
 
 `--multisite` costs one extra WP-CLI call (`wp site list`) to enumerate subsites. If it turns out the site isn't actually multisite after all, the script falls back to single-site behavior with a warning rather than failing — safe to pass whenever you're not sure.
 
+### Reliability on a noisy wp-config.php
+
+Some sites' `wp-config.php` prints a PHP warning/notice to stdout on every single WP-CLI bootstrap — most commonly custom multisite domain-mapping code that reads `$_SERVER['HTTP_HOST']` (or similar) without an `isset()` check, which has no meaning in a CLI context. Left unhandled, that text can land inside the table prefix or a query result and corrupt the SQL sent to the database.
+
+This is handled, not just detected:
+- **Table prefix / multisite blog-ID resolution**: noise lines are stripped out and the real value (even a non-standard prefix like `wp_xfpfyq561c`) is recovered from what's left. Only if nothing usable survives does it fall back to a hardcoded default (`wp_` / single-site), with a `WARNING:` explaining why.
+- **Every other DB check**: if a query's output still looks contaminated after that, the result is treated as `0, unknown` — not silently counted as `0, confirmed clean`. A `WARNING: query for '<check>' failed or produced a PHP warning/notice` line is printed (stdout/terminal) identifying exactly which check, immediately followed by a `Spot-check manually: <exact wp-cli command>` line — the same query, ready to paste and re-run by hand to confirm the true answer wasn't silently swallowed.
+- **The saved report**: since a saved `--output` file (or a published Google Doc) only ever shows the numeric count — indistinguishable from a real zero — Section 5 (Confidence Assessment) gets an explicit callout whenever any check was affected, so this is visible even to someone who never saw the original terminal output.
+
 ## Scope
 
 This is audit-only. It does not delete, patch, or remediate anything on the target site.

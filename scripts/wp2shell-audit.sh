@@ -100,8 +100,20 @@ cleanup() {
   if [[ -n "$CLEANUP_TMP" ]]; then
     rm -rf "$CLEANUP_TMP"
   fi
+  if [[ -n "$QUERY_FAILURE_MARKER" ]]; then
+    rm -f "$QUERY_FAILURE_MARKER"
+  fi
 }
 trap cleanup EXIT
+
+# sanitize_query_result() is always invoked as `$(sanitize_query_result ...)`
+# by its callers (they need its stdout), which forks a subshell — any plain
+# variable assignment made inside that function body (e.g. QUERY_FAILURE_SEEN=1)
+# would mutate only that subshell's copy and vanish the instant it exits,
+# never reaching the parent shell. A file, unlike a shell variable, is real
+# OS-level state visible across that subshell boundary, so it's used here
+# instead — confirmed directly: a plain variable flag silently never stuck.
+QUERY_FAILURE_MARKER=$(mktemp)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -229,6 +241,15 @@ fi
 pass=0
 flag=0
 
+# Set whenever contaminated WP-CLI/PHP bootstrap output is detected anywhere
+# in the DB-check phase (a noisy wp-config.php, most commonly). The saved
+# report only ever shows numeric counts, and a check degraded to "unknown"
+# by sanitize_query_result() prints 0 there — identical to a genuinely clean
+# result. Without this flag surfaced into the report (see Section 5 below),
+# that distinction only ever existed on stderr/terminal, invisible to anyone
+# reading a saved --output file or a published Google Doc.
+QUERY_FAILURE_SEEN=0
+
 strip_ansi() {
   # WP-CLI/Terminus color output embeds raw ANSI escapes; the Google Docs
   # API returns a bare 500 if any survive into the uploaded content.
@@ -249,14 +270,35 @@ is_query_failure() {
   printf '%s' "$1" | strip_ansi | grep -qE '(Error:|Warning:|Notice:|Fatal error:|Deprecated:)'
 }
 
+# Row/count data can't be told apart line-by-line (a warning could sit next
+# to real rows), so is_query_failure()/sanitize_query_result() discard the
+# whole result rather than guess. A scalar or short list (table prefix,
+# blog IDs) is different: real WP-CLI bootstrap noise is always its own
+# line(s), so stripping just those lines and keeping whatever's left
+# recovers the real value instead of blindly discarding it — which matters
+# because the caller's hardcoded fallback (e.g. 'wp_') is only correct for
+# a site that happens to already use that default; on a site with BOTH a
+# customized value AND a noisy bootstrap, a blind fallback would silently
+# run every later check against the wrong tables instead of the real ones.
+strip_php_noise() {
+  printf '%s' "$1" | strip_ansi | grep -vE '(Error:|Warning:|Notice:|Fatal error:|Deprecated:)'
+}
+
 # Returns $1 unchanged if it looks like real data, or nothing (plus a
 # stderr warning) if it looks like a failed query — callers should treat an
 # empty result as "0, unknown" rather than "0, confirmed clean" (the
-# warning printed here is what makes that distinction visible).
+# warning printed here is what makes that distinction visible). Optional
+# $3 is the exact command a human can paste in to spot-check by hand —
+# confirmed directly against a real noisy-bootstrap site: the discarded
+# result matched the true (zero) answer on manual re-run.
 sanitize_query_result() {
-  local raw="$1" label="$2"
+  local raw="$1" label="$2" spotcheck="${3:-}"
   if is_query_failure "$raw"; then
+    echo 1 >> "$QUERY_FAILURE_MARKER"
     echo "WARNING: query for '$label' failed or produced a PHP warning/notice — treating as unknown (0), NOT counted as evidence. First line: $(printf '%s' "$raw" | strip_ansi | grep -m1 .)" >&2
+    if [[ -n "$spotcheck" ]]; then
+      echo "  Spot-check manually: $spotcheck" >&2
+    fi
     return
   fi
   printf '%s' "$raw"
@@ -314,7 +356,7 @@ run_ms_check() {
     table=$(blog_table "$blog_id" "$base_table")
     query="${query_tmpl//__TABLE__/$table}"
     raw=$($WP_CLI db query --silent "$query" --skip-plugins --skip-themes 2>/dev/null || true)
-    sanitized=$(sanitize_query_result "$raw" "$label (blog $blog_id)")
+    sanitized=$(sanitize_query_result "$raw" "$label (blog $blog_id)" "$WP_CLI db query --silent \"$query\" --skip-plugins --skip-themes")
     n_b=$(printf '%s' "$sanitized" | grep -c . || true)
     if [[ "$n_b" -gt 0 ]]; then
       if [[ "$MULTISITE" -eq 1 ]]; then
@@ -441,9 +483,12 @@ else
   # WordPress table prefix is frequently customized (e.g. wp_xfpfyq561c
   # instead of wp_) — never hardcode wp_* table names, always resolve this
   # first and build every query against it.
-  TBL_PREFIX=$( { $WP_CLI config get table_prefix --skip-plugins --skip-themes 2>/dev/null; } || true)
+  TBL_PREFIX_RAW=$( { $WP_CLI config get table_prefix --skip-plugins --skip-themes 2>/dev/null; } || true)
+  TBL_PREFIX=$(strip_php_noise "$TBL_PREFIX_RAW" | grep -m1 .)
   if [[ -z "$TBL_PREFIX" ]]; then
-    echo "Could not resolve table prefix via wp config get — falling back to 'wp_'." >&2
+    QUERY_FAILURE_SEEN=1
+    echo "WARNING: could not resolve table prefix via 'wp config get' (empty output, or entirely PHP warning/notice noise with no real value left over) — falling back to 'wp_'. If this site's real prefix is NOT 'wp_', every DB check below will silently find nothing (wrong tables), not confirm a clean site — verify the prefix manually if in doubt. Raw output: $(printf '%s' "$TBL_PREFIX_RAW" | strip_ansi | tr '\n' ' ')" >&2
+    echo "  Spot-check manually: $WP_CLI config get table_prefix --skip-plugins --skip-themes" >&2
     TBL_PREFIX="wp_"
   fi
   echo "Table prefix: ${TBL_PREFIX}"
@@ -459,10 +504,19 @@ else
   BLOG_IDS="1"
   if [[ "$MULTISITE" -eq 1 ]]; then
     blog_ids_raw=$($WP_CLI site list --field=blog_id --skip-plugins --skip-themes 2>/dev/null || true)
-    if is_query_failure "$blog_ids_raw" || [[ -z "$(printf '%s' "$blog_ids_raw" | tr -d '[:space:]')" ]]; then
-      echo "WARNING: --multisite was given but 'wp site list' returned nothing — this may not actually be a WordPress Multisite install. Falling back to a single site (blog 1)." >&2
+    # A blog ID is always a bare integer on its own line — filtering to
+    # that shape (not just stripping known Warning:/Notice:/etc. text)
+    # also catches bootstrap noise that doesn't match those exact labels.
+    blog_ids_clean=$(strip_php_noise "$blog_ids_raw" | grep -E '^[0-9]+$' || true)
+    if [[ -z "$(printf '%s' "$blog_ids_clean" | tr -d '[:space:]')" ]]; then
+      # Only a genuine failure signal (not just "this really isn't
+      # multisite") if the raw output actually looked contaminated —
+      # a clean, truly-empty response is a normal negative result, not
+      # something to flag as reduced confidence in the saved report.
+      if is_query_failure "$blog_ids_raw"; then QUERY_FAILURE_SEEN=1; fi
+      echo "WARNING: --multisite was given but 'wp site list' returned no usable blog IDs (empty, or entirely PHP warning/notice noise) — this may not actually be a WordPress Multisite install, or the real blog list could not be read. Falling back to a single site (blog 1). Raw output: $(printf '%s' "$blog_ids_raw" | strip_ansi | tr '\n' ' ')" >&2
     else
-      BLOG_IDS="$blog_ids_raw"
+      BLOG_IDS="$blog_ids_clean"
       echo "Multisite install — auditing $(printf '%s' "$BLOG_IDS" | grep -c . || true) site(s): $(printf '%s' "$BLOG_IDS" | tr '\n' ' ')"
     fi
   fi
@@ -525,7 +579,7 @@ else
       else
         echo "== post_status breakdown for anomaly review =="
       fi
-      $WP_CLI db query --silent "
+      breakdown_query="
         SELECT post_status, COUNT(*) AS row_count FROM ${t_posts_b} WHERE post_status NOT IN (
           'publish','future','draft','pending','private','trash',
           'auto-draft','inherit',
@@ -533,7 +587,10 @@ else
           'acf-disabled',
           'wc-pending','wc-processing','wc-on-hold','wc-completed',
           'wc-cancelled','wc-refunded','wc-failed','wc-checkout-draft'
-        ) GROUP BY post_status ORDER BY row_count DESC LIMIT 20;" --skip-plugins --skip-themes 2>/dev/null || true
+        ) GROUP BY post_status ORDER BY row_count DESC LIMIT 20;"
+      breakdown_raw=$($WP_CLI db query --silent "$breakdown_query" --skip-plugins --skip-themes 2>/dev/null || true)
+      breakdown=$(sanitize_query_result "$breakdown_raw" "post_status breakdown (blog ${blog_id})" "$WP_CLI db query --silent \"$breakdown_query\" --skip-plugins --skip-themes")
+      [[ -n "$breakdown" ]] && printf '%s\n' "$breakdown"
     done
 
     # Cross-reference for the breakdown above — without this, "does this
@@ -545,7 +602,9 @@ else
     # WP-CLI's plugin list without --url reflects the main site's context.
     echo
     echo "== active plugins for post_status cross-reference =="
-    $WP_CLI plugin list --status=active --fields=name,title --format=csv --skip-plugins --skip-themes 2>/dev/null || true
+    plugins_raw=$($WP_CLI plugin list --status=active --fields=name,title --format=csv --skip-plugins --skip-themes 2>/dev/null || true)
+    plugins=$(sanitize_query_result "$plugins_raw" "active plugins list" "$WP_CLI plugin list --status=active --fields=name,title --format=csv --skip-plugins --skip-themes")
+    [[ -n "$plugins" ]] && printf '%s\n' "$plugins"
   fi
 
   # Not filtered by post_status: a forged changeset can sit in any status
@@ -576,11 +635,12 @@ else
     report "${T_POSTMETA} rows referencing example.invalid" "$n_postmeta" $postmeta
   fi
 
-  orphans_raw=$($WP_CLI db query --silent "
+  orphans_query="
     SELECT um.user_id FROM ${T_USERMETA} um
     LEFT JOIN ${T_USERS} u ON u.ID = um.user_id
-    WHERE u.ID IS NULL LIMIT 20;" --skip-plugins --skip-themes 2>/dev/null || true)
-  orphans=$(sanitize_query_result "$orphans_raw" "orphaned ${T_USERMETA} rows")
+    WHERE u.ID IS NULL LIMIT 20;"
+  orphans_raw=$($WP_CLI db query --silent "$orphans_query" --skip-plugins --skip-themes 2>/dev/null || true)
+  orphans=$(sanitize_query_result "$orphans_raw" "orphaned ${T_USERMETA} rows" "$WP_CLI db query --silent \"$orphans_query\" --skip-plugins --skip-themes")
   n_orphans=$(printf '%s' "$orphans" | grep -c . || true)
   report "orphaned ${T_USERMETA} rows" "$n_orphans" $orphans
 
@@ -591,12 +651,13 @@ else
   # REPLACE() here — some layer between WP-CLI and Terminus misclassifies
   # any query containing that keyword as a write statement and returns
   # "Rows affected: -1" instead of the actual result set.
-  suspusers_raw=$($WP_CLI db query --silent "
+  suspusers_query="
     SELECT CONCAT(ID, ':', user_login)
     FROM ${T_USERS}
     WHERE user_login REGEXP '^[a-z0-9]+_[0-9a-f]{6,}\$'
-       OR display_name REGEXP '^[a-z0-9]+_[0-9a-f]{6,}\$';" --skip-plugins --skip-themes 2>/dev/null || true)
-  suspusers=$(sanitize_query_result "$suspusers_raw" "suspicious <prefix>_<hex>-style usernames")
+       OR display_name REGEXP '^[a-z0-9]+_[0-9a-f]{6,}\$';"
+  suspusers_raw=$($WP_CLI db query --silent "$suspusers_query" --skip-plugins --skip-themes 2>/dev/null || true)
+  suspusers=$(sanitize_query_result "$suspusers_raw" "suspicious <prefix>_<hex>-style usernames" "$WP_CLI db query --silent \"$suspusers_query\" --skip-plugins --skip-themes")
   n_suspusers=$(printf '%s' "$suspusers" | grep -c . || true)
   report "suspicious <prefix>_<hex>-style usernames" "$n_suspusers" $suspusers
 
@@ -605,11 +666,14 @@ else
   # broader net for anything that doesn't match it.
   echo
   echo "== Recent user accounts for anomaly review =="
-  $WP_CLI db query --silent "
+  recentusers_query="
     SELECT ID, user_login, user_email, user_registered, display_name
     FROM ${T_USERS}
     ORDER BY user_registered DESC
-    LIMIT 100;" --skip-plugins --skip-themes 2>/dev/null || true
+    LIMIT 100;"
+  recentusers_raw=$($WP_CLI db query --silent "$recentusers_query" --skip-plugins --skip-themes 2>/dev/null || true)
+  recentusers=$(sanitize_query_result "$recentusers_raw" "recent user accounts" "$WP_CLI db query --silent \"$recentusers_query\" --skip-plugins --skip-themes")
+  [[ -n "$recentusers" ]] && printf '%s\n' "$recentusers"
 
   # Every site has admins — a nonzero count here is not itself a flag, it's
   # a priority list: check these specific accounts first during Stage 2
@@ -626,13 +690,16 @@ else
   fi
   echo
   echo "== Administrator-role accounts for anomaly review =="
-  $WP_CLI db query --silent "
+  admins_query="
     SELECT u.ID, u.user_login, u.user_email, u.user_registered, u.display_name, um.meta_key AS site_role_key
     FROM ${T_USERS} u
     JOIN ${T_USERMETA} um ON um.user_id = u.ID
     WHERE (${CAP_CLAUSE})
       AND um.meta_value LIKE '%administrator%'
-    ORDER BY u.user_registered DESC;" --skip-plugins --skip-themes 2>/dev/null || true
+    ORDER BY u.user_registered DESC;"
+  admins_raw=$($WP_CLI db query --silent "$admins_query" --skip-plugins --skip-themes 2>/dev/null || true)
+  admins=$(sanitize_query_result "$admins_raw" "administrator-role accounts" "$WP_CLI db query --silent \"$admins_query\" --skip-plugins --skip-themes")
+  [[ -n "$admins" ]] && printf '%s\n' "$admins"
 
   # Network Super Admin — full control over EVERY subsite, the
   # highest-value target on a compromised multisite network. This is a
@@ -646,9 +713,11 @@ else
   if [[ "$MULTISITE" -eq 1 ]]; then
     echo
     echo "== Network Super Admin accounts for anomaly review =="
-    site_admins_raw=$($WP_CLI db query --silent "
-      SELECT meta_value FROM ${TBL_PREFIX}sitemeta WHERE meta_key = 'site_admins';" --skip-plugins --skip-themes 2>/dev/null || true)
-    site_admins=$( { printf '%s' "$site_admins_raw" | grep -oE 's:[0-9]+:"[^"]*"' | sed -E 's/^s:[0-9]+:"//; s/"$//'; } || true)
+    site_admins_query="
+      SELECT meta_value FROM ${TBL_PREFIX}sitemeta WHERE meta_key = 'site_admins';"
+    site_admins_raw=$($WP_CLI db query --silent "$site_admins_query" --skip-plugins --skip-themes 2>/dev/null || true)
+    site_admins_clean=$(sanitize_query_result "$site_admins_raw" "network site_admins" "$WP_CLI db query --silent \"$site_admins_query\" --skip-plugins --skip-themes")
+    site_admins=$( { printf '%s' "$site_admins_clean" | grep -oE 's:[0-9]+:"[^"]*"' | sed -E 's/^s:[0-9]+:"//; s/"$//'; } || true)
     if [[ -n "$site_admins" ]]; then
       printf '%s\n' "$site_admins"
     else
@@ -798,6 +867,11 @@ fi)
 
 ## 5. Confidence Assessment
 
+$(if [[ "$QUERY_FAILURE_SEEN" -eq 1 || -s "$QUERY_FAILURE_MARKER" ]]; then
+cat <<QFEOF
+- **One or more Database checks in Section 4 could not be verified: the site's WP-CLI bootstrap printed a PHP warning/notice to stdout that corrupted part of the query output — commonly caused by a non-standard \`wp-config.php\` (e.g. code reading \`\$_SERVER['HTTP_HOST']\` without an \`isset()\` check, which has no meaning in a CLI context).** Any Section 4 check this affected shows \`0\` because it's being treated as unknown, NOT because it was confirmed clean — this report alone can't distinguish the two. The original terminal/stdout output from this run has \`WARNING: query for '<check>' failed or produced a PHP warning/notice\` lines identifying exactly which check(s) were affected; re-run with \`--stdout\` to see them again if that's no longer available.
+QFEOF
+fi)
 - Section 4 (Database) results are the most reliable — they don't depend on log retention or debug-logging configuration.
 - Section 3 (PHP error log) results corroborate Section 4 but can under-report on environments where verbose error logging is off.
 - Section 2 (Nginx) is complete for the log retention window fetched from every appserver reached, but a fully clean Section 2 does not rule out compromise if Sections 3/4 are non-zero — it means the later attack stages left no nginx-visible trace in this window, not that they didn't happen.

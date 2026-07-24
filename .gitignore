@@ -3,3 +3,4 @@ __pycache__/
 wp2shell-report-*.md
 download.html
 .tmp-pantheon-logo.png
+tests/
