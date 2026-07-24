@@ -292,7 +292,7 @@ n_upload=$(access_stream | grep -c 'update.php?action=upload-plugin' || true)
 report "wp-admin plugin-upload POSTs" "$n_upload"
 
 users=$( { access_stream | grep -oE 'delete_user=[a-z0-9_]+' | sort -u; } || true)
-n_deleteuser=$(echo -n "$users" | grep -c . || true)
+n_deleteuser=$(printf '%s' "$users" | grep -c . || true)
 report "delete_user= cleanup calls" "$n_deleteuser" $users
 
 n_wplogin=$( { access_stream | awk '
@@ -304,7 +304,7 @@ n_wplogin=$( { access_stream | awk '
 report "wp-login 302 with no prior attempt logged (IP-hop heuristic, see header)" "$n_wplogin"
 
 vers=$( { access_stream | grep -oE '"WordPress/[0-9.]+;' | sort -u | tr -d '"' | tr -d ';'; } || true)
-n_selfua=$(echo -n "$vers" | grep -c . || true)
+n_selfua=$(printf '%s' "$vers" | grep -c . || true)
 report "WordPress self-request UA (oEmbed loopback / version fingerprint)" "$n_selfua" $vers
 
 n_recon=$(access_stream | grep -E 'readme\.html|wp-includes/version\.php' | grep -civE 'mozilla' || true)
@@ -321,7 +321,7 @@ authorexcl=$( { access_stream \
     | grep -oiE 'author([._+]|%20)exclude=[^&\" ]*' \
     | grep -viE '=([0-9]|%2c|,)*$' \
     | sort -u; } || true)
-n_authorexcl=$(echo -n "$authorexcl" | grep -c . || true)
+n_authorexcl=$(printf '%s' "$authorexcl" | grep -c . || true)
 report "author_exclude SQLi payload (non-numeric value)" "$n_authorexcl" $authorexcl
 
 # Only catches the GET-based variant (params in the query string, visible
@@ -394,7 +394,7 @@ else
       'wc-cancelled','wc-refunded','wc-failed','wc-checkout-draft'
     );" --skip-plugins --skip-themes 2>/dev/null || true)
   invalid=$(sanitize_query_result "$invalid_raw" "invalid post_status")
-  n_invalid=$(echo -n "$invalid" | grep -c . || true)
+  n_invalid=$(printf '%s' "$invalid" | grep -c . || true)
   report "${T_POSTS} with invalid post_status" "$n_invalid" $invalid
 
   # Distinct remaining status values (not per-row IDs, which is what made
@@ -437,20 +437,20 @@ else
     SELECT ID FROM ${T_POSTS} WHERE post_type = 'customize_changeset'
       AND (post_date = '2020-01-01 00:00:00' OR post_content LIKE '%example.invalid%');" --skip-plugins --skip-themes 2>/dev/null || true)
   changesets=$(sanitize_query_result "$changesets_raw" "suspicious changesets")
-  n_changesets=$(echo -n "$changesets" | grep -c . || true)
+  n_changesets=$(printf '%s' "$changesets" | grep -c . || true)
   report "suspicious changesets" "$n_changesets" $changesets
 
   navmenu_raw=$($WP_CLI db query --silent "
     SELECT ID FROM ${T_POSTS} WHERE post_type = 'nav_menu_item'
       AND post_date = '2020-01-01 00:00:00';" --skip-plugins --skip-themes 2>/dev/null || true)
   navmenu=$(sanitize_query_result "$navmenu_raw" "forged nav_menu_item rows")
-  n_navmenu=$(echo -n "$navmenu" | grep -c . || true)
+  n_navmenu=$(printf '%s' "$navmenu" | grep -c . || true)
   report "forged nav_menu_item rows" "$n_navmenu" $navmenu
 
   postmeta_raw=$($WP_CLI db query --silent "
     SELECT DISTINCT post_id FROM ${T_POSTMETA} WHERE meta_value LIKE '%example.invalid%';" --skip-plugins --skip-themes 2>/dev/null || true)
   postmeta=$(sanitize_query_result "$postmeta_raw" "${T_POSTMETA} rows referencing example.invalid")
-  n_postmeta=$(echo -n "$postmeta" | grep -c . || true)
+  n_postmeta=$(printf '%s' "$postmeta" | grep -c . || true)
   report "${T_POSTMETA} rows referencing example.invalid" "$n_postmeta" $postmeta
 
   orphans_raw=$($WP_CLI db query --silent "
@@ -458,7 +458,7 @@ else
     LEFT JOIN ${T_USERS} u ON u.ID = um.user_id
     WHERE u.ID IS NULL LIMIT 20;" --skip-plugins --skip-themes 2>/dev/null || true)
   orphans=$(sanitize_query_result "$orphans_raw" "orphaned ${T_USERMETA} rows")
-  n_orphans=$(echo -n "$orphans" | grep -c . || true)
+  n_orphans=$(printf '%s' "$orphans" | grep -c . || true)
   report "orphaned ${T_USERMETA} rows" "$n_orphans" $orphans
 
   # Flags accounts named like <prefix>_<hex> (e.g. wp2_74cc526ddf49,
@@ -474,7 +474,7 @@ else
     WHERE user_login REGEXP '^[a-z0-9]+_[0-9a-f]{6,}\$'
        OR display_name REGEXP '^[a-z0-9]+_[0-9a-f]{6,}\$';" --skip-plugins --skip-themes 2>/dev/null || true)
   suspusers=$(sanitize_query_result "$suspusers_raw" "suspicious <prefix>_<hex>-style usernames")
-  n_suspusers=$(echo -n "$suspusers" | grep -c . || true)
+  n_suspusers=$(printf '%s' "$suspusers" | grep -c . || true)
   report "suspicious <prefix>_<hex>-style usernames" "$n_suspusers" $suspusers
 
   # Raw data for the LLM/human judgment pass (see the wp2shell-audit skill) —
