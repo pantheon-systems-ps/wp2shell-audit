@@ -37,17 +37,20 @@ or, for terminal-only output with no file saved:
 
 Only add `--gws` if the user has explicitly asked for a Google Doc — see Stage 3.
 
-Pulls logs directly from every appserver backing the environment, runs nginx/PHP-error-log/DB checks (`batch/v1` traffic, `author_exclude` SQLi payloads — including the `author.exclude`/`author exclude` WAF-evasion spellings, nested privileged REST writes via batch (GET-based only), SQLi errors, forged `customize_changeset` rows in any status, forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, invalid `post_status` rows, `<prefix>_<hex>`-style usernames), and writes the findings to a local markdown file (or prints them, with `--stdout`). It does **not** publish anywhere by default — Stage 3 is optional and only runs on request.
+**If the site is a WordPress Multisite (WPMS) install, add `--multisite`.** Without it, only the main site (blog 1) gets checked — every subsite's own tables are silently skipped, which misses real findings entirely, not just under-reports them. If the user's own request says it's multisite (e.g. "audit SITE.ENV, it's a multisite") — that's sufficient on its own, add the flag, don't ask again to double-confirm. If they didn't say either way and you don't already know, ask (or check `wp-admin` → Network Admin being present/absent, only if you have browser access). `--multisite` costs one extra WP-CLI call (`wp site list`) and is a no-op safety net if it turns out not to be multisite after all (falls back to single-site behavior with a warning) — when in doubt, use it.
+
+Pulls logs directly from every appserver backing the environment, runs nginx/PHP-error-log/DB checks (`batch/v1` traffic, `author_exclude` SQLi payloads — including the `author.exclude`/`author exclude` WAF-evasion spellings, nested privileged REST writes via batch (GET-based only), SQLi errors, forged `customize_changeset` rows in any status, forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, invalid `post_status` rows, `<prefix>_<hex>`-style usernames — across every subsite with `--multisite`, not just the main site), and writes the findings to a local markdown file (or prints them, with `--stdout`). It does **not** publish anywhere by default — Stage 3 is optional and only runs on request.
 
 Output includes:
 - A `[FLAG]`/`[ ok ]` line per check
 - `Report saved to: /path/to/wp2shell-report-<site-slug>-<timestamp>.md` — capture this path, Stage 3 edits this exact file
 - A block labeled `== Recent user accounts for anomaly review ==`: the site's 100 most recently registered users (`ID, user_login, user_email, user_registered, display_name`)
-- A block labeled `== Administrator-role accounts for anomaly review ==`: every account holding the administrator role, by registration date — check these first, a nonzero count is normal (every site has admins), it's a priority list, not a flag
+- A block labeled `== Administrator-role accounts for anomaly review ==`: every account holding the administrator role, by registration date — check these first, a nonzero count is normal (every site has admins), it's a priority list, not a flag. With `--multisite`, this covers admins on every subsite (tagged by which capability key/blog matched), not just the main site — a subsite-only admin is otherwise invisible.
+- **With `--multisite` only**: `== Network Super Admin accounts for anomaly review ==` — accounts with network-wide Super Admin status (full control over every subsite). Check this block *first*, before the regular administrator list — a planted Super Admin is the highest-value target on a compromised multisite network.
 
 ## Stage 2 — user-account anomaly review
 
-Check the `== Administrator-role accounts for anomaly review ==` block first — a planted admin account is the highest-value target for this pattern of attack. Then read the `== Recent user accounts for anomaly review ==` block. Look for accounts that break the pattern of the rest of the list:
+If this was run with `--multisite`, check `== Network Super Admin accounts for anomaly review ==` first — full network control is a bigger prize than any single subsite's admin role. Then check `== Administrator-role accounts for anomaly review ==` — a planted admin account is the highest-value target for this pattern of attack. Then read the `== Recent user accounts for anomaly review ==` block. Look for accounts that break the pattern of the rest of the list:
 
 - `user_login` that looks auto-generated — random hex/alphanumeric, no relation to a real name
 - `user_email` mismatched with `user_login`, or on a disposable/throwaway-mail domain

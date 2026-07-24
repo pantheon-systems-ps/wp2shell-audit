@@ -144,6 +144,53 @@ terminus wp <site>.<env> -- db query "
 
 Each of these (other than the administrator-list query, which is context, not a flag) should return no rows on a clean site. Any row returned is a finding, not a false positive — WordPress does not produce these values on its own.
 
+## Step 4b: If your site is a WordPress Multisite (WPMS) network
+
+**Every query above only checked your main site.** A multisite network's other subsites have their own separate tables — WordPress's own convention: the main site (blog ID 1) uses the unprefixed tables above (`wp_posts`, etc.), but every other subsite has its own set, named `wp_<blog_id>_posts`, `wp_<blog_id>_postmeta`, and so on. If you don't repeat the checks against those tables too, a compromised subsite's forged content is invisible — not just under-reported, completely missed.
+
+First, list every subsite and its blog ID:
+
+```
+terminus wp <site>.<env> -- site list --fields=blog_id,url --skip-plugins --skip-themes
+```
+
+If this errors out ("not a multisite installation" or similar), your site isn't WPMS — skip this section, Step 4's checks already covered everything. Otherwise, for **each** blog ID returned (other than `1`, which you already checked above), repeat the four post/postmeta queries from Step 4 with that blog's own table names substituted in — e.g. for blog ID `5`, the invalid-`post_status` check becomes:
+
+```
+terminus wp <site>.<env> -- db query "
+  SELECT ID FROM wp_5_posts WHERE post_status NOT IN (
+    'publish','future','draft','pending','private','trash',
+    'auto-draft','inherit',
+    'request-pending','request-confirmed','request-failed','request-completed',
+    'acf-disabled'
+  );" --skip-plugins --skip-themes
+```
+
+...and likewise for the `customize_changeset`, `nav_menu_item`, and `postmeta`/`example.invalid` checks — swap `wp_posts`/`wp_postmeta` for `wp_5_posts`/`wp_5_postmeta` (or whichever blog ID you're checking).
+
+**Administrator accounts on a specific subsite** use a per-blog capability key instead of the shared one — for blog ID `5`, that's `wp_5_capabilities` (not `wp_capabilities`). Repeat the administrator-list query from Step 4 once per blog ID, swapping in that blog's own key:
+
+```
+terminus wp <site>.<env> -- db query "
+  SELECT u.ID, u.user_login, u.user_email, u.user_registered, u.display_name
+  FROM wp_users u
+  JOIN wp_usermeta um ON um.user_id = u.ID
+  WHERE um.meta_key = 'wp_5_capabilities'
+    AND um.meta_value LIKE '%administrator%'
+  ORDER BY u.user_registered DESC;" --skip-plugins --skip-themes
+```
+
+**Check for network Super Admins** (full control over every subsite on the network — the single highest-value target on a compromised multisite, check this first):
+
+```
+terminus wp <site>.<env> -- db query "
+  SELECT meta_value FROM wp_sitemeta WHERE meta_key = 'site_admins';" --skip-plugins --skip-themes
+```
+
+This returns one PHP-serialized value, not a clean list — look for `s:<length>:"<username>"` entries inside it; each one is a Super Admin's username. Every WPMS network has at least one (normal), but review the full list the same way you'd review the administrator list above — a name that doesn't belong is the highest-priority finding this guide can produce.
+
+The orphaned-usermeta and throwaway-username checks from Step 4 don't need repeating — `wp_users`/`wp_usermeta` are shared network-wide, not per-subsite, so those two queries already covered every subsite in one pass.
+
 ## Step 5: If anything comes back positive
 
 - Do not delete the flagged posts, users, or accounts yourself.

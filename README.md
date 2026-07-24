@@ -54,6 +54,12 @@ or, against logs you've already downloaded:
 ./scripts/wp2shell-audit.sh --logs /path/to/log/dir --wp "terminus wp SITE.ENV --" --output /path/to/dir
 ```
 
+or, if the site is a WordPress Multisite (WPMS) install, add `--multisite` to check every subsite, not just the main one:
+
+```
+./scripts/wp2shell-audit.sh --site SITE.ENV --multisite --output /path/to/dir
+```
+
 This runs every deterministic check (nginx access log, PHP error log, and — if `--wp`/`--site` is given — direct database queries), prints a `[FLAG]`/`[ ok ]` line per check, and either saves the full findings to a markdown file in the directory you gave `--output`, or prints them straight to the terminal with `--stdout`. One of `--output`/`--stdout` is required — there's no default location. It does not publish anywhere and never requires `gws` unless you ask for it. To publish as a Google Doc, add `--gws` to the same command (requires `gws` installed and authenticated), or run the generator yourself afterward against a saved report:
 
 ```
@@ -82,6 +88,16 @@ scripts/
 - **Database** (requires `--wp`/`--site`): posts with an invalid `post_status` (the whitelist includes WooCommerce's standard order statuses, since those can cover hundreds of thousands of legitimate rows on an active store; a `post_status` breakdown block is printed for anything else non-standard, for a judgment call rather than an automatic flag), forged `customize_changeset` rows (any status), forged `nav_menu_item` rows, `postmeta` rows referencing `example.invalid`, orphaned `usermeta` rows, `<prefix>_<hex>`-style throwaway-admin usernames, and a full list of administrator-role accounts by registration date (for prioritizing the anomaly review).
 
 The database checks are the highest-confidence signal — none of them depend on log retention or debug-logging configuration, and WordPress cannot produce these specific results through normal operation. Standard nginx access logs never capture POST body content, so any of the above sent entirely inside a POST body (rather than the URL/query string) is invisible to the nginx-log checks — that's a data-source limit, not a gap a different grep would close.
+
+### WordPress Multisite (WPMS)
+
+By default, only the main site (blog ID 1) gets checked — a multisite install's other subsites have their own separate tables (`wp_<blog_id>_posts`, etc., WordPress's own per-site convention) that are silently skipped entirely, not just under-reported. Pass `--multisite` to check every subsite:
+
+- The four post/postmeta-based checks above (invalid `post_status`, forged `customize_changeset`/`nav_menu_item` rows, `postmeta` referencing `example.invalid`) run against every subsite's own tables, not just the main site's. Row IDs are tagged `blog<ID>:<row-ID>`, since post IDs restart per subsite and aren't meaningful without knowing which subsite's table they came from.
+- The administrator-role listing covers every subsite's own capability key, not just the main site's — a subsite-only admin is otherwise invisible.
+- A new check: network **Super Admin** accounts (`wp_sitemeta`'s `site_admins` option) — full control over every subsite on the network, the single highest-value target on a compromised multisite. This has no single-site equivalent; it's only checked with `--multisite`.
+
+`--multisite` costs one extra WP-CLI call (`wp site list`) to enumerate subsites. If it turns out the site isn't actually multisite after all, the script falls back to single-site behavior with a warning rather than failing — safe to pass whenever you're not sure.
 
 ## Scope
 

@@ -49,6 +49,20 @@
 #           created it — nothing is shared automatically. Omit this flag
 #           entirely (the default) and the audit runs fully without gws —
 #           it is never required just to run the audit.
+# --multisite  Opt-in only — without it, behavior is unchanged (single
+#           implicit site, no extra WP-CLI calls). With it, requires --wp/
+#           --site: enumerates every subsite via `wp site list` and runs
+#           the four post/postmeta-based DB checks against EACH subsite's
+#           own tables (WordPress's per-site table convention — blog 1 is
+#           unprefixed, e.g. `wp_posts`; every other blog ID is
+#           `<prefix><blog_id>_posts`, confirmed directly against a real
+#           multisite install), tags findings by blog ID, and adds two
+#           multisite-only checks: administrators on ANY subsite (not just
+#           the main site), and network Super Admins (`wp_sitemeta`'s
+#           `site_admins` option — full control over every subsite, the
+#           highest-value target on a compromised network). Without this
+#           flag, a multisite install only ever gets its main site (blog 1)
+#           checked — every subsite's own tables are silently skipped.
 #
 # Also prints (not included in the report) the site's 100 most recently
 # registered users, plus a separate list of every administrator-role
@@ -72,6 +86,7 @@ MD_FILE=""
 OUTPUT_DIR=""
 STDOUT_ONLY=0
 DO_GWS=0
+MULTISITE=0
 
 # Only cleans up the terminus logs tempdir — MD_FILE is Stage 1's actual
 # deliverable now (SKILL.md Stage 2/3 read and edit it before publishing),
@@ -96,6 +111,7 @@ while [[ $# -gt 0 ]]; do
     --output) OUTPUT_DIR="$2"; shift 2 ;;
     --stdout) STDOUT_ONLY=1; shift ;;
     --gws)    DO_GWS=1; shift ;;
+    --multisite) MULTISITE=1; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -164,7 +180,7 @@ fetch_all_appserver_logs() {
   fi
 
   host="appserver.${site_env}.${uuid}.drush.in"
-  ips=$(dig +short "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+  ips=$(dig +short "$host" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
   if [[ -z "$ips" ]]; then
     echo "No appserver DNS records found for ${site_name}.${site_env} (${host}) — environment may not exist or isn't provisioned." >&2
     return 1
@@ -266,6 +282,50 @@ md_list() {
   else
     printf -- '- `%s`\n' "$@"
   fi
+}
+
+# WordPress's own per-site table convention: blog 1 (the main site) uses
+# unprefixed tables (e.g. wp_posts); every other blog ID gets its own
+# infixed set (wp_<blog_id>_posts) — confirmed directly against a real
+# multisite install.
+blog_table() {
+  local blog_id="$1" base="$2"
+  if [[ "$blog_id" == "1" ]]; then
+    echo "${TBL_PREFIX}${base}"
+  else
+    echo "${TBL_PREFIX}${blog_id}_${base}"
+  fi
+}
+
+# Runs $3 (a query containing the literal token __TABLE__) once per blog ID
+# in $BLOG_IDS, substituting each blog's own table name in turn, and
+# accumulates a total count (MS_COUNT) plus a combined, blog-tagged row
+# list (MS_LIST) — tags are only added when --multisite was actually given,
+# so a default (non-multisite) run's output is byte-identical to a single
+# direct query against $T_POSTS/etc. No `local -n` here: stock macOS bash
+# (3.2.57) has no namerefs, so results are returned via these two globals
+# by convention rather than a generic return value.
+run_ms_check() {
+  local label="$1" base_table="$2" query_tmpl="$3"
+  local blog_id table query raw sanitized n_b tagged
+  MS_COUNT=0
+  MS_LIST=""
+  for blog_id in $BLOG_IDS; do
+    table=$(blog_table "$blog_id" "$base_table")
+    query="${query_tmpl//__TABLE__/$table}"
+    raw=$($WP_CLI db query --silent "$query" --skip-plugins --skip-themes 2>/dev/null || true)
+    sanitized=$(sanitize_query_result "$raw" "$label (blog $blog_id)")
+    n_b=$(printf '%s' "$sanitized" | grep -c . || true)
+    if [[ "$n_b" -gt 0 ]]; then
+      if [[ "$MULTISITE" -eq 1 ]]; then
+        tagged=$(printf '%s\n' "$sanitized" | sed "s/^/blog${blog_id}:/")
+      else
+        tagged="$sanitized"
+      fi
+      MS_LIST="${MS_LIST}${MS_LIST:+$'\n'}${tagged}"
+    fi
+    MS_COUNT=$((MS_COUNT + n_b))
+  done
 }
 
 # Recursive: fetch_all_appserver_logs lands each appserver's logs in its
@@ -392,6 +452,21 @@ else
   T_USERMETA="${TBL_PREFIX}usermeta"
   T_POSTMETA="${TBL_PREFIX}postmeta"
 
+  # BLOG_IDS drives every post/postmeta check below via run_ms_check().
+  # Without --multisite this is always just "1" (blog 1, unprefixed tables)
+  # — identical to this script's behavior before multisite support existed,
+  # and zero extra WP-CLI calls for the common (non-multisite) case.
+  BLOG_IDS="1"
+  if [[ "$MULTISITE" -eq 1 ]]; then
+    blog_ids_raw=$($WP_CLI site list --field=blog_id --skip-plugins --skip-themes 2>/dev/null || true)
+    if is_query_failure "$blog_ids_raw" || [[ -z "$(printf '%s' "$blog_ids_raw" | tr -d '[:space:]')" ]]; then
+      echo "WARNING: --multisite was given but 'wp site list' returned nothing — this may not actually be a WordPress Multisite install. Falling back to a single site (blog 1)." >&2
+    else
+      BLOG_IDS="$blog_ids_raw"
+      echo "Multisite install — auditing $(printf '%s' "$BLOG_IDS" | grep -c . || true) site(s): $(printf '%s' "$BLOG_IDS" | tr '\n' ' ')"
+    fi
+  fi
+
   # Beyond WordPress core's own statuses, several widely-used plugins
   # register their own legitimate custom post_status values — most
   # commonly WooCommerce's order-status set (wc-completed/wc-pending/etc.),
@@ -403,18 +478,31 @@ else
   # place to add arbitrary/one-off statuses; anything else non-standard
   # still surfaces below for a judgment call instead of being silently
   # trusted or silently flagged.
-  invalid_raw=$($WP_CLI db query --silent "
-    SELECT ID FROM ${T_POSTS} WHERE post_status NOT IN (
+  # Beyond WordPress core's own statuses, several widely-used plugins
+  # register their own legitimate custom post_status values — most
+  # commonly WooCommerce's order-status set (wc-completed/wc-pending/etc.),
+  # which on an active store can affect hundreds of thousands of rows and
+  # would otherwise swamp this check with pure noise. This list is
+  # WooCommerce's own standard, documented order statuses only — not a
+  # place to add arbitrary/one-off statuses; anything else non-standard
+  # still surfaces below for a judgment call instead of being silently
+  # trusted or silently flagged.
+  run_ms_check "invalid post_status" "posts" "
+    SELECT ID FROM __TABLE__ WHERE post_status NOT IN (
       'publish','future','draft','pending','private','trash',
       'auto-draft','inherit',
       'request-pending','request-confirmed','request-failed','request-completed',
       'acf-disabled',
       'wc-pending','wc-processing','wc-on-hold','wc-completed',
       'wc-cancelled','wc-refunded','wc-failed','wc-checkout-draft'
-    );" --skip-plugins --skip-themes 2>/dev/null || true)
-  invalid=$(sanitize_query_result "$invalid_raw" "invalid post_status")
-  n_invalid=$(printf '%s' "$invalid" | grep -c . || true)
-  report "${T_POSTS} with invalid post_status" "$n_invalid" $invalid
+    );"
+  n_invalid=$MS_COUNT
+  invalid=$MS_LIST
+  if [[ "$MULTISITE" -eq 1 ]]; then
+    report "posts with invalid post_status (across all sites)" "$n_invalid" $invalid
+  else
+    report "${T_POSTS} with invalid post_status" "$n_invalid" $invalid
+  fi
 
   # Distinct remaining status values (not per-row IDs, which is what made
   # this check unusable on a large site — one status shared by hundreds of
@@ -425,24 +513,36 @@ else
   # exactly one or two rows, or one that looks like random/injected
   # content rather than a plugin's own naming, is the more suspicious
   # shape. This never overrides the automated verdict above — it's context
-  # for whoever reviews a FLAGGED result.
+  # for whoever reviews a FLAGGED result. Looped per blog on multisite —
+  # a GROUP BY against a clean blog's table simply returns no rows, so no
+  # separate per-blog nonzero tracking is needed here.
   if [[ "$n_invalid" -gt 0 ]]; then
-    echo
-    echo "== post_status breakdown for anomaly review =="
-    $WP_CLI db query --silent "
-      SELECT post_status, COUNT(*) AS row_count FROM ${T_POSTS} WHERE post_status NOT IN (
-        'publish','future','draft','pending','private','trash',
-        'auto-draft','inherit',
-        'request-pending','request-confirmed','request-failed','request-completed',
-        'acf-disabled',
-        'wc-pending','wc-processing','wc-on-hold','wc-completed',
-        'wc-cancelled','wc-refunded','wc-failed','wc-checkout-draft'
-      ) GROUP BY post_status ORDER BY row_count DESC LIMIT 20;" --skip-plugins --skip-themes 2>/dev/null || true
+    for blog_id in $BLOG_IDS; do
+      t_posts_b=$(blog_table "$blog_id" posts)
+      echo
+      if [[ "$MULTISITE" -eq 1 ]]; then
+        echo "== post_status breakdown for anomaly review (blog ${blog_id}: ${t_posts_b}) =="
+      else
+        echo "== post_status breakdown for anomaly review =="
+      fi
+      $WP_CLI db query --silent "
+        SELECT post_status, COUNT(*) AS row_count FROM ${t_posts_b} WHERE post_status NOT IN (
+          'publish','future','draft','pending','private','trash',
+          'auto-draft','inherit',
+          'request-pending','request-confirmed','request-failed','request-completed',
+          'acf-disabled',
+          'wc-pending','wc-processing','wc-on-hold','wc-completed',
+          'wc-cancelled','wc-refunded','wc-failed','wc-checkout-draft'
+        ) GROUP BY post_status ORDER BY row_count DESC LIMIT 20;" --skip-plugins --skip-themes 2>/dev/null || true
+    done
 
     # Cross-reference for the breakdown above — without this, "does this
     # look plugin-like" was a naming-convention guess. This is the actual
     # active-plugin list, so a status prefix can be matched to a real,
     # named, installed plugin instead of just judged plausible-looking.
+    # Network-activated plugins show here regardless of blog; a plugin
+    # activated on only one specific subsite (not network-wide) may not —
+    # WP-CLI's plugin list without --url reflects the main site's context.
     echo
     echo "== active plugins for post_status cross-reference =="
     $WP_CLI plugin list --status=active --fields=name,title --format=csv --skip-plugins --skip-themes 2>/dev/null || true
@@ -452,25 +552,29 @@ else
   # (e.g. 'auto-draft', which is a normal transient state for this post
   # type), so restricting to 'publish' let real forgeries slip through.
   # The post_date/post_content signature is specific enough on its own.
-  changesets_raw=$($WP_CLI db query --silent "
-    SELECT ID FROM ${T_POSTS} WHERE post_type = 'customize_changeset'
-      AND (post_date = '2020-01-01 00:00:00' OR post_content LIKE '%example.invalid%');" --skip-plugins --skip-themes 2>/dev/null || true)
-  changesets=$(sanitize_query_result "$changesets_raw" "suspicious changesets")
-  n_changesets=$(printf '%s' "$changesets" | grep -c . || true)
+  run_ms_check "suspicious changesets" "posts" "
+    SELECT ID FROM __TABLE__ WHERE post_type = 'customize_changeset'
+      AND (post_date = '2020-01-01 00:00:00' OR post_content LIKE '%example.invalid%');"
+  n_changesets=$MS_COUNT
+  changesets=$MS_LIST
   report "suspicious changesets" "$n_changesets" $changesets
 
-  navmenu_raw=$($WP_CLI db query --silent "
-    SELECT ID FROM ${T_POSTS} WHERE post_type = 'nav_menu_item'
-      AND post_date = '2020-01-01 00:00:00';" --skip-plugins --skip-themes 2>/dev/null || true)
-  navmenu=$(sanitize_query_result "$navmenu_raw" "forged nav_menu_item rows")
-  n_navmenu=$(printf '%s' "$navmenu" | grep -c . || true)
+  run_ms_check "forged nav_menu_item rows" "posts" "
+    SELECT ID FROM __TABLE__ WHERE post_type = 'nav_menu_item'
+      AND post_date = '2020-01-01 00:00:00';"
+  n_navmenu=$MS_COUNT
+  navmenu=$MS_LIST
   report "forged nav_menu_item rows" "$n_navmenu" $navmenu
 
-  postmeta_raw=$($WP_CLI db query --silent "
-    SELECT DISTINCT post_id FROM ${T_POSTMETA} WHERE meta_value LIKE '%example.invalid%';" --skip-plugins --skip-themes 2>/dev/null || true)
-  postmeta=$(sanitize_query_result "$postmeta_raw" "${T_POSTMETA} rows referencing example.invalid")
-  n_postmeta=$(printf '%s' "$postmeta" | grep -c . || true)
-  report "${T_POSTMETA} rows referencing example.invalid" "$n_postmeta" $postmeta
+  run_ms_check "postmeta rows referencing example.invalid" "postmeta" "
+    SELECT DISTINCT post_id FROM __TABLE__ WHERE meta_value LIKE '%example.invalid%';"
+  n_postmeta=$MS_COUNT
+  postmeta=$MS_LIST
+  if [[ "$MULTISITE" -eq 1 ]]; then
+    report "postmeta rows referencing example.invalid (across all sites)" "$n_postmeta" $postmeta
+  else
+    report "${T_POSTMETA} rows referencing example.invalid" "$n_postmeta" $postmeta
+  fi
 
   orphans_raw=$($WP_CLI db query --silent "
     SELECT um.user_id FROM ${T_USERMETA} um
@@ -509,16 +613,48 @@ else
 
   # Every site has admins — a nonzero count here is not itself a flag, it's
   # a priority list: check these specific accounts first during Stage 2
-  # instead of scanning all 100 recent signups blind to role.
+  # instead of scanning all 100 recent signups blind to role. On multisite,
+  # admin status is granted per-blog via <prefix><blog_id>_capabilities
+  # (blog 1: unprefixed <prefix>capabilities) — a single capabilities key
+  # only ever caught blog 1's admins, missing subsite-only ones entirely.
+  CAP_CLAUSE="um.meta_key = '${TBL_PREFIX}capabilities'"
+  if [[ "$MULTISITE" -eq 1 ]]; then
+    for blog_id in $BLOG_IDS; do
+      [[ "$blog_id" == "1" ]] && continue
+      CAP_CLAUSE="${CAP_CLAUSE} OR um.meta_key = '${TBL_PREFIX}${blog_id}_capabilities'"
+    done
+  fi
   echo
   echo "== Administrator-role accounts for anomaly review =="
   $WP_CLI db query --silent "
-    SELECT u.ID, u.user_login, u.user_email, u.user_registered, u.display_name
+    SELECT u.ID, u.user_login, u.user_email, u.user_registered, u.display_name, um.meta_key AS site_role_key
     FROM ${T_USERS} u
     JOIN ${T_USERMETA} um ON um.user_id = u.ID
-    WHERE um.meta_key = '${TBL_PREFIX}capabilities'
+    WHERE (${CAP_CLAUSE})
       AND um.meta_value LIKE '%administrator%'
     ORDER BY u.user_registered DESC;" --skip-plugins --skip-themes 2>/dev/null || true
+
+  # Network Super Admin — full control over EVERY subsite, the
+  # highest-value target on a compromised multisite network. This is a
+  # completely different mechanism from per-blog admin capabilities: a
+  # serialized PHP array in wp_sitemeta's site_admins option, not user meta
+  # at all. Extracted via the serialized-string marker (s:<len>:"<value>")
+  # rather than writing a full PHP unserializer for one field — confirmed
+  # directly this extracts cleanly against a real network's site_admins
+  # value. wp_sitemeta doesn't exist on a non-multisite install, so this
+  # only runs with --multisite.
+  if [[ "$MULTISITE" -eq 1 ]]; then
+    echo
+    echo "== Network Super Admin accounts for anomaly review =="
+    site_admins_raw=$($WP_CLI db query --silent "
+      SELECT meta_value FROM ${TBL_PREFIX}sitemeta WHERE meta_key = 'site_admins';" --skip-plugins --skip-themes 2>/dev/null || true)
+    site_admins=$( { printf '%s' "$site_admins_raw" | grep -oE 's:[0-9]+:"[^"]*"' | sed -E 's/^s:[0-9]+:"//; s/"$//'; } || true)
+    if [[ -n "$site_admins" ]]; then
+      printf '%s\n' "$site_admins"
+    else
+      echo "(none found, or could not parse wp_sitemeta site_admins — check manually)"
+    fi
+  fi
 fi
 
 echo
@@ -543,6 +679,17 @@ else
   REPORT_SLUG="$(basename "$LOG_DIR")"
 fi
 REPORT_SLUG="${REPORT_SLUG:-audit}"
+
+# Multisite covers more than one table set per check, so the single-table
+# label ("wp_posts with invalid post_status") isn't accurate there — swap
+# in a generic label instead. Single-site output is unaffected either way.
+if [[ "$MULTISITE" -eq 1 ]]; then
+  LABEL_INVALID="posts with invalid post_status (across all sites)"
+  LABEL_POSTMETA="postmeta rows referencing example.invalid (across all sites)"
+else
+  LABEL_INVALID="${T_POSTS} with invalid post_status"
+  LABEL_POSTMETA="${T_POSTMETA} rows referencing example.invalid"
+fi
 
 REPORT_CONTENT=$(cat <<EOF
 # wp2shell Security Audit Report — ${REPORT_SITE}
@@ -613,12 +760,14 @@ $(md_list $authorexcl)
 ## 4. Database Analysis
 
 $(if [[ -z "$WP_CLI" ]]; then echo "**Skipped — no \`--wp\`/\`--site\` provided for this run.**"; else cat <<DBEOF
+$(if [[ "$MULTISITE" -eq 1 ]]; then echo "Multisite install — the four post/postmeta-based checks below cover every subsite (blog IDs: $(printf '%s' "$BLOG_IDS" | tr '\n' ' ')), not just the main site. Row IDs are tagged \`blog<ID>:<row-ID>\` since post IDs restart per subsite and aren't meaningful without knowing which subsite's table they came from."; fi)
+
 | Check | Result |
 |---|---|
-| \`${T_POSTS}\` with invalid \`post_status\` | ${n_invalid} |
+| \`${LABEL_INVALID}\` | ${n_invalid} |
 | Suspicious \`customize_changeset\` rows (any status) | ${n_changesets} |
 | Forged \`nav_menu_item\` rows | ${n_navmenu} |
-| \`${T_POSTMETA}\` rows referencing \`example.invalid\` | ${n_postmeta} |
+| \`${LABEL_POSTMETA}\` | ${n_postmeta} |
 | Orphaned \`${T_USERMETA}\` rows | ${n_orphans} |
 | Suspicious \`<prefix>_<hex>\`-style usernames | ${n_suspusers} |
 
@@ -631,7 +780,7 @@ $(md_list $changesets)
 **Forged nav_menu_item row IDs:**
 $(md_list $navmenu)
 
-**${T_POSTMETA} rows referencing example.invalid (post IDs):**
+**${LABEL_POSTMETA} (post IDs):**
 $(md_list $postmeta)
 
 **Orphaned ${T_USERMETA} user IDs:**
@@ -641,6 +790,7 @@ $(md_list $orphans)
 $(md_list $suspusers)
 
 **Assessment:** the invalid-\`post_status\` check is the single highest-confidence signal in this entire report when the status values involved are actually unrecognized — WordPress core cannot natively produce a \`post_status\` outside its known set, and this check's whitelist also excludes WooCommerce's own standard order statuses (\`wc-completed\`, \`wc-pending\`, etc.), which otherwise produced a confirmed false positive at real-world scale (hundreds of thousands of legitimate order rows on one site). If this count is still non-zero, check the \`== post_status breakdown for anomaly review ==\` block printed during the audit (not written to this report) before treating it as compromise — a handful of distinct statuses each covering many rows reads as another plugin's own post type, not forged content; a status on exactly one or two rows, or one that looks like random/injected text rather than a plugin's naming convention, is the more suspicious shape. This does not depend on debug logging or any other environment-specific configuration, unlike Sections 2 and 3. The changeset check is no longer filtered to \`post_status = 'publish'\` — a forged changeset can sit in any status, including the transient \`auto-draft\` state this post type normally uses, so restricting to published rows let real forgeries through undetected. The \`nav_menu_item\` and \`postmeta\` checks target the same \`2020-01-01 00:00:00\` / \`example.invalid\` signature in other tables the exploit is known to touch — like the invalid-\`post_status\` check, these do not depend on debug logging. The suspicious-username check flags any \`user_login\` or \`display_name\` matching \`<prefix>_<hex-string>\` (e.g. \`wp2_74cc526ddf49\`, \`wpsvc_a1b2c3d4e5f6\`) — the throwaway-admin naming convention observed in the reference incident. Only \`user_login\`/\`display_name\` are checked; \`user_email\` is intentionally excluded. A non-zero result here is high-confidence on its own — this pattern does not occur in normal WordPress usage.
+$(if [[ "$MULTISITE" -eq 1 ]]; then echo "On multisite, this also runs against every subsite's own tables — see \`== Administrator-role accounts for anomaly review ==\` (now tagged by which capability key/blog matched) and the new \`== Network Super Admin accounts for anomaly review ==\` block printed during the audit (both stdout-only, not written to this file, same as the existing user-review blocks) for the account-side anomaly review. A planted network Super Admin is the highest-value target on a compromised multisite — check that block first."; fi)
 DBEOF
 fi)
 
