@@ -401,6 +401,60 @@ error_log() {
   done
 }
 
+# Determines the oldest date actually present across every fetched log line
+# (nginx DD/Mon/YYYY and php-error DD-Mon-YYYY timestamps), as a YYYYMMDD
+# string, so the report can say plainly whether the vulnerability window is
+# even inside the available log history — a "no attack found" reading is
+# meaningless if the oldest log entry postdates the window entirely.
+# Deliberately not using rotated-filename dates as a shortcut: confirmed
+# directly that a rotated file's suffix can be a day off from its actual
+# content (e.g. nginx-access.log-20260531.gz's first line was 30/May, not
+# 31/May), and php-error.log's own rotated-file naming isn't a plain date
+# suffix at all. Scanning line content directly avoids depending on either.
+# Not using `date -d` to parse/compare: GNU vs BSD date disagree on accepted
+# formats, and a minimal container may lack GNU date entirely — plain
+# zero-padded YYYYMMDD strings sort/compare correctly as both text and
+# integers without it.
+oldest_log_date() {
+  {
+    access_stream
+    error_log
+  } | awk '
+    BEGIN {
+      split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mo)
+      for (i = 1; i <= 12; i++) mm[mo[i]] = sprintf("%02d", i)
+    }
+    {
+      if (match($0, /[0-9][0-9]\/[A-Za-z][A-Za-z][A-Za-z]\/[0-9][0-9][0-9][0-9]/)) {
+        split(substr($0, RSTART, RLENGTH), a, "/")
+      } else if (match($0, /[0-9][0-9]-[A-Za-z][A-Za-z][A-Za-z]-[0-9][0-9][0-9][0-9]/)) {
+        split(substr($0, RSTART, RLENGTH), a, "-")
+      } else next
+      if (a[2] in mm) print a[3] mm[a[2]] a[1]
+    }
+  ' | sort -n | head -1
+}
+
+OLDEST_LOG_DATE=$(oldest_log_date || true)
+
+# Anchor dates from the Executive Summary: WordPress's 2026-07-17 emergency
+# patch (6.8.6/6.9.5/7.0.2) and Wordfence's 2026-07-20 public disclosure of
+# the chain. Full coverage means the available logs reach back to the patch
+# date itself; anything short of the day after disclosure means the logs
+# don't even span the highest-signal post-disclosure exploitation window.
+LOG_WINDOW_FULL_CUTOFF=20260717
+LOG_WINDOW_NO_COVERAGE_CUTOFF=20260721
+
+if [[ -z "$OLDEST_LOG_DATE" ]]; then
+  LOG_COVERAGE="UNKNOWN"
+elif [[ "$OLDEST_LOG_DATE" -le "$LOG_WINDOW_FULL_CUTOFF" ]]; then
+  LOG_COVERAGE="FULL"
+elif [[ "$OLDEST_LOG_DATE" -le "$LOG_WINDOW_NO_COVERAGE_CUTOFF" ]]; then
+  LOG_COVERAGE="PARTIAL"
+else
+  LOG_COVERAGE="NONE"
+fi
+
 echo "== wp2shell audit: $LOG_DIR =="
 echo
 
@@ -731,10 +785,50 @@ echo "== Summary: $pass ok, $flag flagged =="
 
 ### --- Build the report, save/print it, and optionally publish -------------
 
-if [[ "$n_invalid" -gt 0 || "$n_changesets" -gt 0 || "$n_navmenu" -gt 0 || "$n_postmeta" -gt 0 || "$n_sqli" -gt 0 || "$n_suspusers" -gt 0 ]]; then
-  VERDICT="CONFIRMED COMPROMISE — remediation required"
+# DB indicators reflect current site state and clear once the underlying rows/
+# accounts are actually removed — phrased as "traces found", since that's
+# what a re-run after real DB remediation should stop showing. The SQLi log
+# signature is phrased separately as "confirmed attempt": it's a grep match
+# against historical php-error.log content (fetched fresh each run,
+# including rotated .gz archives — see Section 2 note), so it stays non-zero
+# for as long as that log entry sits in the retention window regardless of
+# whether the DB has been cleaned up, and is kept out of VERDICT so a re-run
+# after remediation doesn't report "traces found" on log evidence alone.
+if [[ "$n_invalid" -gt 0 || "$n_changesets" -gt 0 || "$n_navmenu" -gt 0 || "$n_postmeta" -gt 0 || "$n_suspusers" -gt 0 ]]; then
+  VERDICT="COMPROMISE TRACES FOUND IN DATABASE — remediation required"
 else
-  VERDICT="NO EVIDENCE OF COMPROMISE FOUND"
+  VERDICT="NO COMPROMISE TRACES FOUND IN DATABASE"
+fi
+
+# A zero here is NOT confirmation the exploit was never attempted — it only
+# means no matching entry exists in the logs this run could read. Rather than
+# leave that as a vague caveat, LOG_COVERAGE (computed above from the oldest
+# date actually present in the fetched logs) says plainly whether the
+# available history even reaches back far enough to make a zero meaningful.
+# The database verdict is authoritative for current state regardless; this is
+# supplementary color, decisive when it fires and scoped by coverage when it
+# doesn't.
+if [[ -n "$OLDEST_LOG_DATE" ]]; then
+  OLDEST_LOG_DATE_PRETTY="${OLDEST_LOG_DATE:0:4}-${OLDEST_LOG_DATE:4:2}-${OLDEST_LOG_DATE:6:2}"
+fi
+
+if [[ "$n_sqli" -gt 0 ]]; then
+  LOG_VERDICT="CONFIRMED EXPLOITATION ATTEMPT IN LOGS — historical; does not indicate ongoing compromise"
+else
+  case "$LOG_COVERAGE" in
+    FULL)
+      LOG_VERDICT="NO EXPLOITATION ATTEMPT FOUND — available logs go back to ${OLDEST_LOG_DATE_PRETTY}, which covers the full vulnerability window"
+      ;;
+    PARTIAL)
+      LOG_VERDICT="NO EXPLOITATION ATTEMPT FOUND, BUT LOG COVERAGE IS PARTIAL — available logs only go back to ${OLDEST_LOG_DATE_PRETTY}, not far enough to fully clear the vulnerability window"
+      ;;
+    NONE)
+      LOG_VERDICT="LOGS DO NOT COVER THE VULNERABILITY WINDOW — available logs only go back to ${OLDEST_LOG_DATE_PRETTY}"
+      ;;
+    *)
+      LOG_VERDICT="NO EXPLOITATION ATTEMPT FOUND IN AVAILABLE LOGS — could not determine how far back available logs go; treat as inconclusive"
+      ;;
+  esac
 fi
 
 REPORT_SITE="${SITE:-$LOG_DIR}"
@@ -772,7 +866,8 @@ REPORT_CONTENT=$(cat <<EOF
 | Audit Date | ${REPORT_DATE} |
 | Tooling | wp2shell-audit.sh (automated, no manual write-up) |
 | Scope | Audit only — no remediation/cleanup performed |
-| Status | **${VERDICT}** |
+| Status (database) | **${VERDICT}** |
+| Status (logs) | **${LOG_VERDICT}** |
 
 ---
 
@@ -780,9 +875,12 @@ REPORT_CONTENT=$(cat <<EOF
 
 This report covers CVE-2026-60137 (unauthenticated SQL injection via \`author__not_in\`) and CVE-2026-63030 (REST API \`batch/v1\` route-confusion), the chained WordPress Core vulnerability disclosed by Wordfence 2026-07-20 following WordPress's 2026-07-17 emergency patch (6.8.6 / 6.9.5 / 7.0.2).
 
-**Verdict: ${VERDICT}**
+**Database verdict: ${VERDICT}**
+**Log verdict: ${LOG_VERDICT}**
 
-The six highest-confidence indicators — invalid \`post_status\` rows, forged \`customize_changeset\` rows, forged \`nav_menu_item\` rows, malicious \`postmeta\` rows referencing \`example.invalid\`, \`author__not_in\` SQLi errors, and \`<prefix>_<hex>\`-style usernames — are independent and mutually corroborating when non-zero. All other checks are supporting evidence only; see per-section assessments below.
+The five highest-confidence *database* indicators — invalid \`post_status\` rows, forged \`customize_changeset\` rows, forged \`nav_menu_item\` rows, malicious \`postmeta\` rows referencing \`example.invalid\`, and \`<prefix>_<hex>\`-style usernames — are independent and mutually corroborating when non-zero, and reflect the site's *current* state: a legitimate DB cleanup should bring all five to zero on a re-run.
+
+The \`author__not_in\` SQLi error signature is evaluated separately from the database verdict. It comes from the PHP error log, which is re-fetched from the appserver on every run (including rotated \`.gz\` archives) and reflects *historical* activity — a non-zero count is confirmed evidence the exploit was attempted at some point in the log retention window, but it does not clear when the DB is remediated and does not by itself mean the site is still compromised. If the database verdict is clean but this log signature is non-zero, that is the expected state for a successfully remediated site whose logs haven't yet rotated out — not a sign remediation failed. Conversely, a zero on the log verdict is only meaningful if the available logs actually reach back far enough to cover the vulnerability window — the log verdict above states this explicitly (full/partial/no coverage, with the oldest available log date) rather than leaving it as an open question. Treat the database verdict as authoritative for current-state compromise; the log verdict is corroborating historical color, weighted by how far back it actually reaches. All other checks are supporting evidence only; see per-section assessments below.
 
 ---
 
@@ -822,7 +920,7 @@ $(md_list $authorexcl)
 | Nested REST dispatch / \`Constant REST_REQUEST already defined\` (CVE-2026-63030 signature) | ${n_nested} |
 | Changeset-publish pipeline stall marker (\`Undefined array key "user_login"\`) | ${n_stall} |
 
-**Assessment:** a non-zero SQLi count is direct, confirmed evidence CVE-2026-60137 fired — this is not inferred. All three signatures depend on verbose PHP error logging (\`WP_DEBUG_LOG\`-style) being enabled. This is common on Dev but Pantheon Live environments do not run with \`WP_DEBUG\` on — a zero result here on Live is not meaningful evidence of anything and should not be read as "no compromise"; rely on Section 4 instead. On Dev/Test, treat a zero result with the same caution unless debug logging is independently confirmed enabled.
+**Assessment:** a non-zero SQLi count is direct, confirmed evidence CVE-2026-60137 fired at some point — this is not inferred. It is historical, not current-state, evidence: this log file is re-fetched from the appserver on every run, so the count stays non-zero for as long as that entry remains within the log retention window, independent of any DB remediation performed since. Do not read a non-zero count here on a re-audit as proof remediation failed — check the Section 4 (Database Analysis) verdict for that. All three signatures depend on verbose PHP error logging (\`WP_DEBUG_LOG\`-style) being enabled. This is common on Dev but Pantheon Live environments do not run with \`WP_DEBUG\` on — a zero result here on Live is not meaningful evidence of anything and should not be read as "no compromise"; rely on Section 4 instead. On Dev/Test, treat a zero result with the same caution unless debug logging is independently confirmed enabled. A zero result can also simply mean the available log history doesn't reach back far enough to cover the vulnerability window at all, regardless of what happened on the site — see the log coverage note in Section 5 for whether that applies here before reading this section's zero as meaningful.
 
 ---
 
@@ -885,6 +983,28 @@ cat <<APPEOF
 - Log coverage: all ${APPSERVERS_TOTAL} backing appserver(s) were reached.
 APPEOF
 fi)
+$(case "$LOG_COVERAGE" in
+FULL)
+cat <<COVEOF
+- **Log date coverage: FULL.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which reaches back to the 2026-07-17 patch date — a clean Section 3 result can be read as meaningful for the whole vulnerability window.
+COVEOF
+;;
+PARTIAL)
+cat <<COVEOF
+- **Log date coverage: PARTIAL.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which does not reach back to the 2026-07-17 patch date. A clean Section 3 result only covers the period from ${OLDEST_LOG_DATE_PRETTY} forward — it says nothing about anything earlier.
+COVEOF
+;;
+NONE)
+cat <<COVEOF
+- **Log date coverage: NONE.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which is after the 2026-07-20 disclosure date — the available logs don't reach back into the vulnerability window at all. A clean Section 3 result here should not be treated as reassuring.
+COVEOF
+;;
+*)
+cat <<COVEOF
+- **Log date coverage: UNKNOWN.** Could not determine how far back the available logs go — treat Section 3's result as inconclusive rather than clean.
+COVEOF
+;;
+esac)
 EOF
 )
 
