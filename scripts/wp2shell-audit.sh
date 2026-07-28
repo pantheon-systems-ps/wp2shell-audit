@@ -983,28 +983,23 @@ cat <<APPEOF
 - Log coverage: all ${APPSERVERS_TOTAL} backing appserver(s) were reached.
 APPEOF
 fi)
-$(case "$LOG_COVERAGE" in
-FULL)
+$(if [[ "$LOG_COVERAGE" == "FULL" ]]; then
 cat <<COVEOF
 - **Log date coverage: FULL.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which reaches back to the 2026-07-17 patch date — a clean Section 3 result can be read as meaningful for the whole vulnerability window.
 COVEOF
-;;
-PARTIAL)
+elif [[ "$LOG_COVERAGE" == "PARTIAL" ]]; then
 cat <<COVEOF
 - **Log date coverage: PARTIAL.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which does not reach back to the 2026-07-17 patch date. A clean Section 3 result only covers the period from ${OLDEST_LOG_DATE_PRETTY} forward — it says nothing about anything earlier.
 COVEOF
-;;
-NONE)
+elif [[ "$LOG_COVERAGE" == "NONE" ]]; then
 cat <<COVEOF
 - **Log date coverage: NONE.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which is after the 2026-07-20 disclosure date — the available logs don't reach back into the vulnerability window at all. A clean Section 3 result here should not be treated as reassuring.
 COVEOF
-;;
-*)
+else
 cat <<COVEOF
 - **Log date coverage: UNKNOWN.** Could not determine how far back the available logs go — treat Section 3's result as inconclusive rather than clean.
 COVEOF
-;;
-esac)
+fi)
 EOF
 )
 
