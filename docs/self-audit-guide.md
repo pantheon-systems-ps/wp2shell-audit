@@ -23,13 +23,23 @@ In `wp-admin`, go to **Dashboard → Updates**. Confirm you're on 6.8.6, 6.9.5, 
    - Any account registered on or right after 2026-07-17–2026-07-20 (the disclosure window) that you don't recognize.
 4. A single account with a mismatched name/email (e.g., a staff member's old login paired with a new email after a name change) is common and not on its own suspicious — only flag accounts matching the *specific* patterns above.
 
-## Step 3: Review site logs (requires Terminus CLI access)
+## Step 3: Review site logs (requires Terminus CLI access + a plugin)
 
-If you or your development team have Terminus installed and authenticated (`terminus auth:login`), you can pull and search your own logs:
+If you or your development team have Terminus installed and authenticated (`terminus auth:login`), you can pull and search your own logs.
+
+**`logs:get` is not a stock Terminus command.** It comes from the [Terminus Site Debug plugin](https://github.com/pantheon-systems/terminus-site-debug), which you must install first — a plain Terminus install will just report the command as unknown:
+
+```
+terminus self:plugin:install pantheon-systems/terminus-site-debug
+```
+
+Confirm it registered before continuing (`terminus logs:get --help` should print usage rather than an error), then pull the logs:
 
 ```
 terminus logs:get <site>.<env> --all /path/to/local/logs
 ```
+
+If the fetch fails with an SSH error (exit 255) rather than an authentication problem, that's a known limitation of how this plugin connects — see the [README](../README.md) for the `scripts/wp2shell-audit.sh --site` path, which fetches the same logs without the plugin. Step 4's database checks don't need the plugin at all, and are the more reliable evidence regardless.
 
 Then search the downloaded logs for these patterns:
 
