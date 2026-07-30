@@ -57,8 +57,14 @@ zgrep -oiE 'author([._+]|%20)exclude=[^&" ]*' /path/to/local/logs/*/nginx-access
 # catches the GET-based variant; see the note below.
 zgrep -i 'batch/v1' /path/to/local/logs/*/nginx-access.log* | grep -icE 'wp/v2/users|wp/v2/plugins'
 
-# Plugin-upload POST requests via wp-admin
-zgrep -c 'update.php?action=upload-plugin' /path/to/local/logs/*/nginx-access.log*
+# Plugin-upload POST requests via wp-admin. The method filter matters: only
+# a POST here is a real upload (WordPress posts the ZIP to this URL behind a
+# nonce check). A GET of the same URL is an unauthenticated scanner probe
+# that WP bounces to wp-login.php, and commodity scanners generate those in
+# volume — counting them reads as late-stage exploitation when nothing
+# happened. Bounding the match inside the quoted request field also stops it
+# matching this URL when it merely shows up as a later request's referer.
+zgrep -cE '"POST [^"]*update\.php\?[^"]*action=upload-plugin' /path/to/local/logs/*/nginx-access.log*
 
 # User-deletion cleanup calls (attacker covering tracks)
 zgrep -oE 'delete_user=[a-z0-9_]+' /path/to/local/logs/*/nginx-access.log* | sort -u
@@ -70,7 +76,7 @@ zgrep -c 'post_author NOT IN' /path/to/local/logs/*/php-error.log*
 zgrep -c 'Constant REST_REQUEST already defined' /path/to/local/logs/*/php-error.log*
 ```
 
-Any non-zero result on the batch/v1, author_exclude, nested-write, plugin-upload, or delete_user checks is worth investigating further. The PHP error log checks only work if verbose debug logging was enabled at the time — a zero result there doesn't clear the site on its own; treat Step 4 as more reliable.
+Any non-zero result on the batch/v1, author_exclude, nested-write, plugin-upload, or delete_user checks is worth investigating further. On plugin-upload specifically, remember that a legitimate administrator installing a plugin by ZIP produces exactly the same POST — a hit is a lead to reconcile against your own admin activity, not a verdict. The PHP error log checks only work if verbose debug logging was enabled at the time — a zero result there doesn't clear the site on its own; treat Step 4 as more reliable.
 
 **A note on what these logs can't show you:** standard nginx access logs never capture POST body content. If the batch endpoint, the author_exclude payload, or a nested privileged write was sent entirely inside a POST body rather than the URL/query string, none of the above greps will see it. A clean result here reduces confidence in an attack, it doesn't rule one out — Step 4 is not affected by this limitation.
 

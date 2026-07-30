@@ -463,7 +463,26 @@ echo
 n_batch=$(access_stream | grep -cE '(\?rest_route=/batch/v1|/wp-json/batch/v1)' || true)
 report "batch/v1 route hits" "$n_batch"
 
-n_upload=$(access_stream | grep -c 'update.php?action=upload-plugin' || true)
+# Anchored to a POST inside the quoted request field, for two reasons.
+# First, the method: WordPress only ever performs the actual plugin-ZIP
+# upload as a POST to this URL (the form on plugin-install.php?tab=upload
+# posts here, and update.php's upload-plugin branch runs behind
+# check_admin_referer()) — a GET of the same URL is an unauthenticated
+# probe that WP bounces to wp-login.php, which is exactly what commodity
+# scanners generate in volume. Confirmed directly: a customer running the
+# unmethod-filtered version got 24 matches, all GETs, reported back as a
+# late-stage-exploitation signal; and this validation set's own logs show
+# the matching scanner shape (`GET /wp-admin/update.php` from
+# Go-http-client, immediately 302'd to `wp-login.php?redirect_to=...`).
+# Second, the quoted-field bound ([^"]*): Pantheon's nginx format logs the
+# referer and user-agent as their own quoted fields after the request, so
+# an unanchored grep also counts this URL when it appears merely as the
+# referer of some later request — the same false-positive class already
+# fixed for the batch/v1 check.
+# `\?[^"]*action=` rather than a literal `?action=`: core emits the params
+# in that order, but query-string order isn't guaranteed and an attacker
+# can pad ahead of it, so don't hard-depend on adjacency.
+n_upload=$(access_stream | grep -cE '"POST [^"]*update\.php\?[^"]*action=upload-plugin' || true)
 report "wp-admin plugin-upload POSTs" "$n_upload"
 
 users=$( { access_stream | grep -oE 'delete_user=[a-z0-9_]+' | sort -u; } || true)
@@ -908,7 +927,7 @@ $(md_list $vers)
 **\`author_exclude\` payload values found:**
 $(md_list $authorexcl)
 
-**Assessment:** prior to this CVE's disclosure, the \`batch/v1\` route had near-zero legitimate traffic platform-wide — elevated volume here should be read as a real signal leaning toward attack/probe activity, not dismissed as plausibly-organic REST/Jetpack/mobile-client usage. \`wp-admin\` upload POSTs, \`delete_user=\` calls, and the wp-login-first-try pattern are the direct nginx-side fingerprint of the later RCE/webshell stage seen in prior confirmed exploitation of this chain — zero here means no nginx-log evidence the attack reached that stage, not proof it didn't (see confidence notes below). The \`author_exclude\` check catches the SQLi payload itself (not just its PHP-error side effect in Section 3) and also matches the \`author.exclude\`/\`author exclude\` spellings an attacker can use to dodge a WAF rule written against the literal string \`author_exclude\` — PHP folds all three into the same request parameter when parsing. The nested-privileged-write check only catches a GET-based batch call with sub-request paths in the query string; a POST-body variant of either this or the raw \`batch/v1\` hit itself is invisible to nginx access logs, which do not capture POST body content — a zero on either of these two checks is not evidence the technique wasn't attempted, only that it wasn't attempted in a form the access log can see.
+**Assessment:** prior to this CVE's disclosure, the \`batch/v1\` route had near-zero legitimate traffic platform-wide — elevated volume here should be read as a real signal leaning toward attack/probe activity, not dismissed as plausibly-organic REST/Jetpack/mobile-client usage. \`wp-admin\` upload POSTs, \`delete_user=\` calls, and the wp-login-first-try pattern are the direct nginx-side fingerprint of the later RCE/webshell stage seen in prior confirmed exploitation of this chain — zero here means no nginx-log evidence the attack reached that stage, not proof it didn't (see confidence notes below). The upload check counts only POSTs to the upload URL, since that is the only shape WordPress uses to actually receive a plugin ZIP; unauthenticated GET probes of the same URL are ordinary scanner noise and are deliberately excluded. Note also that a routine administrator installing a plugin by ZIP produces an identical POST, so a nonzero count here is a lead to reconcile against known admin activity, not exploitation on its own. The \`author_exclude\` check catches the SQLi payload itself (not just its PHP-error side effect in Section 3) and also matches the \`author.exclude\`/\`author exclude\` spellings an attacker can use to dodge a WAF rule written against the literal string \`author_exclude\` — PHP folds all three into the same request parameter when parsing. The nested-privileged-write check only catches a GET-based batch call with sub-request paths in the query string; a POST-body variant of either this or the raw \`batch/v1\` hit itself is invisible to nginx access logs, which do not capture POST body content — a zero on either of these two checks is not evidence the technique wasn't attempted, only that it wasn't attempted in a form the access log can see.
 
 ---
 
