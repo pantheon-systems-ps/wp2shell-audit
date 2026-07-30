@@ -865,7 +865,24 @@ REPORT_SLUG="${REPORT_SLUG:-audit}"
 # Multisite covers more than one table set per check, so the single-table
 # label ("wp_posts with invalid post_status") isn't accurate there — swap
 # in a generic label instead. Single-site output is unaffected either way.
-if [[ "$MULTISITE" -eq 1 ]]; then
+#
+# The no-WP_CLI arm exists because $T_POSTS/$T_POSTMETA are only ever
+# assigned inside the DB-check block, which a log-only run (--logs without
+# --wp) skips entirely. Naming them here unconditionally therefore read two
+# unset variables under `set -u` and killed the run at this line — before
+# the report was written, so a log-only audit produced no report at all and
+# exited 1 while still printing a full "10 ok, 1 flagged" summary to the
+# terminal, which looks like success. Confirmed directly against real
+# fetched logs. These labels are only ever consumed inside Section 4's
+# heredoc, which independently renders "Skipped" when there's no --wp, so
+# the generic names below are a safe placeholder rather than a claim that
+# any table was examined — deliberately without the multisite arm's
+# "(across all sites)" suffix, which would imply a scope that was never
+# checked.
+if [[ -z "$WP_CLI" ]]; then
+  LABEL_INVALID="posts with invalid post_status"
+  LABEL_POSTMETA="postmeta rows referencing example.invalid"
+elif [[ "$MULTISITE" -eq 1 ]]; then
   LABEL_INVALID="posts with invalid post_status (across all sites)"
   LABEL_POSTMETA="postmeta rows referencing example.invalid (across all sites)"
 else
