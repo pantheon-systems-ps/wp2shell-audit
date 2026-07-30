@@ -238,7 +238,9 @@ if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
   exit 1
 fi
 
-pass=0
+# Counts non-zero checks. Not printed as a tally (see the end-of-run summary)
+# — its only consumer is the exit code, so a caller can still branch on
+# "anything at all came back non-zero" without parsing output.
 flag=0
 
 # Set whenever contaminated WP-CLI/PHP bootstrap output is detected anywhere
@@ -313,7 +315,6 @@ report() {
     ((flag++)) || true
   else
     printf '[ ok ] %-45s %s\n' "$label" "$count"
-    ((pass++)) || true
   fi
 }
 
@@ -800,7 +801,26 @@ else
 fi
 
 echo
-echo "== Summary: $pass ok, $flag flagged =="
+# Deliberately not a tally. "N ok, M flagged" read as a severity score to the
+# first people who used this — an M of 5 looks like five problems, when a
+# [FLAG] only ever means "this check's count was above zero" and the checks
+# are nowhere near equal in weight (a batch/v1 count carries real signal; two
+# non-browser readme.html hits are scanner noise). Naming what a [FLAG] is,
+# and pointing at the report's per-section assessments for weight, is the
+# only summary that can't be misread as a score.
+#
+# Only printed when something actually flagged, for two reasons: a clean run
+# needs no gloss on a marker it never emitted, and these lines contain the
+# literal string "[FLAG]" — printing them unconditionally means a clean run's
+# output matches a grep for "[FLAG]", which is exactly the false positive the
+# marker exists to avoid (caught by the suite's clean-baseline assertion).
+if [[ "$flag" -gt 0 ]]; then
+  echo "== Checks complete — review each [FLAG] line above =="
+  echo "   A flagged check returned a non-zero count. That is not confirmed compromise,"
+  echo "   and the checks differ in weight — see the assessment notes in the saved report."
+else
+  echo "== Checks complete — every check returned zero =="
+fi
 
 ### --- Build the report, save/print it, and optionally publish -------------
 
@@ -1029,7 +1049,7 @@ cat <<COVEOF
 COVEOF
 elif [[ "$LOG_COVERAGE" == "NONE" ]]; then
 cat <<COVEOF
-- **Log date coverage: NONE.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which is after the 2026-07-20 disclosure date — the available logs don't reach back into the vulnerability window at all. A clean Section 3 result here should not be treated as reassuring.
+- **Log date coverage: NONE.** The oldest available log entry is from ${OLDEST_LOG_DATE_PRETTY}, which is after the 2026-07-20 disclosure date — the available logs don't reach back into the vulnerability window at all, so Section 3 has no bearing on it either way. Section 4 (Database) is the evidence to read here.
 COVEOF
 else
 cat <<COVEOF
