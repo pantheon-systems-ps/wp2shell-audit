@@ -87,6 +87,7 @@ OUTPUT_DIR=""
 STDOUT_ONLY=0
 DO_GWS=0
 MULTISITE=0
+SITE_URL=""
 
 # Only cleans up the terminus logs tempdir — MD_FILE is Stage 1's actual
 # deliverable now (SKILL.md Stage 2/3 read and edit it before publishing),
@@ -124,6 +125,7 @@ while [[ $# -gt 0 ]]; do
     --stdout) STDOUT_ONLY=1; shift ;;
     --gws)    DO_GWS=1; shift ;;
     --multisite) MULTISITE=1; shift ;;
+    --url)    SITE_URL="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -138,6 +140,10 @@ if [[ -n "$OUTPUT_DIR" && "$STDOUT_ONLY" -eq 1 ]]; then
 fi
 if [[ "$DO_GWS" -eq 1 && "$STDOUT_ONLY" -eq 1 ]]; then
   echo "Error: --gws needs a saved report file to publish — use --output instead of --stdout." >&2
+  exit 1
+fi
+if [[ -n "$SITE_URL" && -z "$SITE" ]]; then
+  echo "Error: --url only applies to --site mode — for --logs/--wp mode, bake --url=<url> into your --wp invocation instead." >&2
   exit 1
 fi
 
@@ -231,10 +237,13 @@ if [[ -n "$SITE" ]]; then
   fi
   LOG_DIR="$CLEANUP_TMP"
   WP_CLI="terminus wp $SITE --"
+  if [[ -n "$SITE_URL" ]]; then
+    WP_CLI="terminus wp $SITE -- --url=$SITE_URL"
+  fi
 fi
 
 if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
-  echo "Usage: $0 (--site SITE.ENV | --logs /path/to/log/dir [--wp \"wp-cli invocation\"]) (--output /path/to/dir | --stdout) [--gws]" >&2
+  echo "Usage: $0 (--site SITE.ENV | --logs /path/to/log/dir [--wp \"wp-cli invocation\"]) [--url <url>] (--output /path/to/dir | --stdout) [--gws]" >&2
   exit 1
 fi
 
