@@ -64,6 +64,21 @@
 #           flag, a multisite install only ever gets its main site (blog 1)
 #           checked — every subsite's own tables are silently skipped.
 #
+# --url     Optional, --site mode only. Passed through to WP-CLI as a global
+#           `--url=<url>`, for a multisite whose environment domain is not
+#           itself a registered site in the network's `wp_blogs` table —
+#           WordPress resolves DOMAIN_CURRENT_SITE to the platform domain
+#           (e.g. `live-<site>.pantheonsite.io`), finds no matching blog,
+#           and refuses to bootstrap at all. Confirmed directly against a
+#           real WPMS serving its subsites under a custom domain: without
+#           this flag `wp site list` and `wp plugin list` both fail outright,
+#           while `wp db query` and `wp config get` still work (they need no
+#           resolvable site) — so the failure mode is a --multisite run
+#           silently collapsing to blog 1, not an obviously broken audit.
+#           Pass the network's main site (blog 1). Omitting it leaves the
+#           WP-CLI invocation byte-identical to a run without this flag, so
+#           it costs nothing on a site that doesn't need it.
+#
 # Also prints (not included in the report) the site's 100 most recently
 # registered users, plus a separate list of every administrator-role
 # account by registration date, for the anomaly-review pass described in
