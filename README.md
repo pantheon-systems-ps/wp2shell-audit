@@ -60,6 +60,12 @@ or, if the site is a WordPress Multisite (WPMS) install, add `--multisite` to ch
 ./scripts/wp2shell-audit.sh --site SITE.ENV --multisite --output /path/to/dir
 ```
 
+and if that run fails with `Site '<platform-domain>' not found. Verify DOMAIN_CURRENT_SITE matches an existing site`, add `--url` pointing at the network's main site:
+
+```
+./scripts/wp2shell-audit.sh --site SITE.ENV --multisite --url sites.example.edu --output /path/to/dir
+```
+
 This runs every deterministic check (nginx access log, PHP error log, and — if `--wp`/`--site` is given — direct database queries), prints a `[FLAG]`/`[ ok ]` line per check, and either saves the full findings to a markdown file in the directory you gave `--output`, or prints them straight to the terminal with `--stdout`. One of `--output`/`--stdout` is required — there's no default location. It does not publish anywhere and never requires `gws` unless you ask for it. To publish as a Google Doc, add `--gws` to the same command (requires `gws` installed and authenticated), or run the generator yourself afterward against a saved report:
 
 ```
@@ -98,6 +104,30 @@ By default, only the main site (blog ID 1) gets checked — a multisite install'
 - A new check: network **Super Admin** accounts (`wp_sitemeta`'s `site_admins` option) — full control over every subsite on the network, the single highest-value target on a compromised multisite. This has no single-site equivalent; it's only checked with `--multisite`.
 
 `--multisite` costs one extra WP-CLI call (`wp site list`) to enumerate subsites. If it turns out the site isn't actually multisite after all, the script falls back to single-site behavior with a warning rather than failing — safe to pass whenever you're not sure.
+
+#### `--url` — when WP-CLI can't bootstrap the network
+
+On some multisites, every WP-CLI call that needs a full WordPress bootstrap fails outright:
+
+```
+Error: Site 'live-<site>.pantheonsite.io/' not found. Verify DOMAIN_CURRENT_SITE
+matches an existing site or use `--url=<url>` to override.
+```
+
+This happens when the environment's Pantheon platform domain isn't itself a registered site in the network's `wp_blogs` table — common on a WPMS that serves its subsites under a custom domain that was never added as a blog. WordPress resolves `DOMAIN_CURRENT_SITE` to the platform domain, finds no matching blog, and refuses to boot. It is a property of the network's own domain configuration, not of the environment or the platform: a multisite whose `DOMAIN_CURRENT_SITE` *does* match a real blog needs nothing extra.
+
+Pass `--url <url>` with the network's main site (blog 1) to override it:
+
+```
+./scripts/wp2shell-audit.sh --site SITE.ENV --multisite --url sites.example.edu --output /path/to/dir
+```
+
+Notes:
+
+- **`--url` only applies to `--site` mode.** In `--logs`/`--wp` mode, bake `--url=<url>` into the `--wp` invocation you pass instead; the script rejects the combination rather than silently ignoring it.
+- **Not every check needs it.** `wp db query` and `wp config get` work without a resolvable site, so the table prefix and the raw SQL checks are unaffected. What breaks without `--url` is `wp site list` — which is what `--multisite` uses to enumerate subsites — and `wp plugin list`.
+- **It costs nothing on a site that doesn't need it**, so it's safe to pass whenever a multisite is served under a custom domain.
+- Use the space-separated form (`--url sites.example.edu`). `--url=sites.example.edu` is rejected, matching how every other flag in this script parses.
 
 ### Reliability on a noisy wp-config.php
 

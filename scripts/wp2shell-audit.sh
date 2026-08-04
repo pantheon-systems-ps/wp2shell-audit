@@ -64,6 +64,21 @@
 #           flag, a multisite install only ever gets its main site (blog 1)
 #           checked — every subsite's own tables are silently skipped.
 #
+# --url     Optional, --site mode only. Passed through to WP-CLI as a global
+#           `--url=<url>`, for a multisite whose environment domain is not
+#           itself a registered site in the network's `wp_blogs` table —
+#           WordPress resolves DOMAIN_CURRENT_SITE to the platform domain
+#           (e.g. `live-<site>.pantheonsite.io`), finds no matching blog,
+#           and refuses to bootstrap at all. Confirmed directly against a
+#           real WPMS serving its subsites under a custom domain: without
+#           this flag `wp site list` and `wp plugin list` both fail outright,
+#           while `wp db query` and `wp config get` still work (they need no
+#           resolvable site) — so the failure mode is a --multisite run
+#           silently collapsing to blog 1, not an obviously broken audit.
+#           Pass the network's main site (blog 1). Omitting it leaves the
+#           WP-CLI invocation byte-identical to a run without this flag, so
+#           it costs nothing on a site that doesn't need it.
+#
 # Also prints (not included in the report) the site's 100 most recently
 # registered users, plus a separate list of every administrator-role
 # account by registration date, for the anomaly-review pass described in
@@ -87,6 +102,7 @@ OUTPUT_DIR=""
 STDOUT_ONLY=0
 DO_GWS=0
 MULTISITE=0
+SITE_URL=""
 
 # Only cleans up the terminus logs tempdir — MD_FILE is Stage 1's actual
 # deliverable now (SKILL.md Stage 2/3 read and edit it before publishing),
@@ -124,6 +140,7 @@ while [[ $# -gt 0 ]]; do
     --stdout) STDOUT_ONLY=1; shift ;;
     --gws)    DO_GWS=1; shift ;;
     --multisite) MULTISITE=1; shift ;;
+    --url)    SITE_URL="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -138,6 +155,10 @@ if [[ -n "$OUTPUT_DIR" && "$STDOUT_ONLY" -eq 1 ]]; then
 fi
 if [[ "$DO_GWS" -eq 1 && "$STDOUT_ONLY" -eq 1 ]]; then
   echo "Error: --gws needs a saved report file to publish — use --output instead of --stdout." >&2
+  exit 1
+fi
+if [[ -n "$SITE_URL" && -z "$SITE" ]]; then
+  echo "Error: --url only applies to --site mode — for --logs/--wp mode, bake --url=<url> into your --wp invocation instead." >&2
   exit 1
 fi
 
@@ -231,10 +252,13 @@ if [[ -n "$SITE" ]]; then
   fi
   LOG_DIR="$CLEANUP_TMP"
   WP_CLI="terminus wp $SITE --"
+  if [[ -n "$SITE_URL" ]]; then
+    WP_CLI="terminus wp $SITE -- --url=$SITE_URL"
+  fi
 fi
 
 if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
-  echo "Usage: $0 (--site SITE.ENV | --logs /path/to/log/dir [--wp \"wp-cli invocation\"]) (--output /path/to/dir | --stdout) [--gws]" >&2
+  echo "Usage: $0 (--site SITE.ENV | --logs /path/to/log/dir [--wp \"wp-cli invocation\"]) [--url <url>] (--output /path/to/dir | --stdout) [--gws]" >&2
   exit 1
 fi
 
